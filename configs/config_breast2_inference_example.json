@@ -1,0 +1,185 @@
+{
+    "comps": {
+        "avgexp": true,
+        "celltype": true,
+        "crossattn": true,
+        "use_neighb": true,
+        "neighb": true
+    },
+    "stain_norm": {
+        "norm_train": true,
+        "norm_val": true,
+        "norm_test": true,
+        "fp_norm_ref": "${DATA_ROOT}/breast/aligned_he_image.tif",
+        "resized_scale": 0.2
+    },
+    "regions_val": {
+        "divisions": [
+            [
+                0.0,
+                1.0
+            ]
+        ]
+    },
+    "regions_test": {
+        "divisions": [
+            [
+                0.0,
+                1.0
+            ]
+        ]
+    },
+    "data": {
+        "cell_types": [
+            "B",
+            "Myeloid (excluding macrophage)",
+            "Stromal",
+            "Macrophage",
+            "Malignant",
+            "Epithelial",
+            "Plasma",
+            "T",
+            "Unassigned"
+        ],
+        "min_nuc_area": 10,
+        "expr_scale": 2.0,
+        "num_workers": 32,
+        "hsize": 224,
+        "wsize": 224,
+        "overlap": 30,
+        "max_cells_per_patch": 600,
+        "pin_memory": true,
+        "cache_mode": "disk"
+    },
+    "model": {
+        "emb_dim": 1024,
+        "external_head_ckpt": [],
+        "avgexp_temp": 1.0,
+        "avgexp_residual_scale": 1.0,
+        "ct_prior_blend_alpha": 1.0,
+        "refiner_query_tokens": 8,
+        "ecrm": {
+            "k_target": 12,
+            "k_min": 6,
+            "k_max": 16,
+            "graph_k": 12,
+            "cross_patch_k": 8,
+            "density_gamma": 0.4,
+            "eta_max": 0.6,
+            "gamma_perp_max": 0.3,
+            "trust_floor": 0.5,
+            "trust_scale": 0.4,
+            "depth": 2,
+            "cross_patch": true,
+            "edge_dropout": 0.05,
+            "message_dropout": 0.05,
+            "residual_gate_init": -1.4,
+            "apply_to_ref_weights": false,
+            "apply_to_expr_residual": true
+        },
+        "vq_patch": {
+            "enabled": true,
+            "n_codes": 64,
+            "beta": 0.25,
+            "use_cosine": true,
+            "loss_w": 0.05
+        },
+        "ct_priors_ecrm_unit_enabled": true
+    },
+    "training": {
+        "batch_size": 64,
+        "total_epochs": 30,
+        "learning_rate": 0.00115,
+        "beta1": 0.9,
+        "beta2": 0.999,
+        "weight_decay": 1e-05,
+        "eps": 1e-08,
+        "stain_aug": true,
+        "pearson_loss_weight": 1.0,
+        "expr_ct_embed_loss_weight": 1.0,
+        "logits_loss_weight": 1.0,
+        "expr_var_penalty_weight": 0.0,
+        "ref_entropy_weight": 0,
+        "immune_sampler_boost": 1.5,
+        "use_expr_baseline": false,
+        "holdout_n_genes": 0,
+        "interleave_slide_batches": true,
+        "weighted_interleave_slide_batches": true,
+        "shuffle_within_slide_batches": true,
+        "batch_sampler_seed": 20260419,
+        "panel_use_natural_missing": false
+    },
+    "evaluation": {
+        "parity_tolerance_abs": 0.001,
+        "best_metric_eps": 1e-08,
+        "external_source": "data_sources_test"
+    },
+    "save_freqs": {
+        "model_freq": 1
+    },
+    "data_sources_train_val": [
+        {
+            "slide_idx": 0,
+            "domain_id": 0,
+            "fp_nuc_seg": "${DATA_ROOT}/data_processing/data_processing_breast/he_image_nuclei_seg.tif",
+            "fp_hist": "${DATA_ROOT}/breast/aligned_he_image.tif",
+            "fp_expr": "${DATA_ROOT}/data_processing/data_processing_breast/cell_gene_matrix_filtered.csv",
+            "fp_cell_type": "${DATA_ROOT}/data_processing/data_processing_breast/cell_type_filtered.csv",
+            "fp_nuc_sizes": "${DATA_ROOT}/data_processing/data_processing_breast/matched_nuclei_filtered.csv"
+        },
+        {
+            "slide_idx": 1,
+            "domain_id": 0,
+            "fp_nuc_seg": "${DATA_ROOT}/data_processing/data_processing_breast3/he_image_nuclei_seg.tif",
+            "fp_hist": "${DATA_ROOT}/breast3/aligned_he_image.tif",
+            "fp_expr": "${DATA_ROOT}/data_processing/data_processing_breast3/cell_gene_matrix_filtered.csv",
+            "fp_cell_type": "${DATA_ROOT}/data_processing/data_processing_breast3/cell_type_filtered.csv",
+            "fp_nuc_sizes": "${DATA_ROOT}/data_processing/data_processing_breast3/matched_nuclei_filtered.csv"
+        },
+        {
+            "slide_idx": 5,
+            "domain_id": 0,
+            "fp_nuc_seg": "${DATA_ROOT}/data_processing/data_processing_breast4/he_image_nuclei_seg.tif",
+            "fp_hist": "${DATA_ROOT}/breast4/aligned_he_image.tif",
+            "fp_expr": "${DATA_ROOT}/data_processing/data_processing_breast4/cell_gene_matrix_filtered.csv",
+            "fp_cell_type": "${DATA_ROOT}/data_processing/data_processing_breast4/cell_type_filtered.csv",
+            "fp_nuc_sizes": "${DATA_ROOT}/data_processing/data_processing_breast4/matched_nuclei_filtered.csv"
+        },
+        {
+            "slide_idx": 2,
+            "domain_id": 0,
+            "fp_nuc_seg": "${DATA_ROOT}/data_processing/data_processing_breast5/he_image_nuclei_seg.tif",
+            "fp_hist": "${DATA_ROOT}/breast5/aligned_he_image.tif",
+            "fp_expr": "${DATA_ROOT}/data_processing/data_processing_breast5/cell_gene_matrix_filtered.csv",
+            "fp_cell_type": "${DATA_ROOT}/data_processing/data_processing_breast5/cell_type_filtered.csv",
+            "fp_nuc_sizes": "${DATA_ROOT}/data_processing/data_processing_breast5/matched_nuclei_filtered.csv"
+        },
+        {
+            "slide_idx": 4,
+            "domain_id": 0,
+            "fp_nuc_seg": "${DATA_ROOT}/data_processing/data_processing_breast7/he_image_nuclei_seg.tif",
+            "fp_hist": "${DATA_ROOT}/breast7/aligned_he_image.tif",
+            "fp_expr": "${DATA_ROOT}/data_processing/data_processing_breast7/cell_gene_matrix_filtered.csv",
+            "fp_cell_type": "${DATA_ROOT}/data_processing/data_processing_breast7/cell_type_filtered.csv",
+            "fp_nuc_sizes": "${DATA_ROOT}/data_processing/data_processing_breast7/matched_nuclei_filtered.csv"
+        }
+    ],
+    "data_sources_test": [
+        {
+            "slide_idx": 3,
+            "domain_id": 0,
+            "fp_nuc_seg": "${DATA_ROOT}/data_processing/data_processing_breast2/he_image_nuclei_seg.tif",
+            "fp_hist": "${DATA_ROOT}/data_processing/data_processing_breast2/he_image.tif",
+            "fp_expr": "${DATA_ROOT}/data_processing/data_processing_breast2/cell_gene_matrix_filtered.csv",
+            "fp_cell_type": "${DATA_ROOT}/data_processing/data_processing_breast2/cell_type_filtered.csv",
+            "fp_nuc_sizes": "${DATA_ROOT}/data_processing/data_processing_breast2/matched_nuclei_filtered.csv"
+        }
+    ],
+    "experiment_dirs": {
+        "load_dir": "${RUN_ROOT}/results",
+        "metrics_dir": "${RUN_ROOT}/metrics",
+        "model_dir": "models",
+        "test_output_dir": "test_output",
+        "val_output_dir": "val_output"
+    }
+}
