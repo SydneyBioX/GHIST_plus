@@ -45,7 +45,7 @@ The first run may download the UNI2-h checkpoint through the Hugging Face cache.
 ## Example Notebook
 
 Before running `example.ipynb`, download the example data/model bundle from the
-Google Drive link provided with this release.
+Google Drive link provided with this release: https://drive.google.com/drive/folders/1b3LPQRywaooIDDGBMGVzMvrSLNXokLXx?usp=drive_link.
 
 Name the downloaded folder exactly:
 
