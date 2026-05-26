@@ -1,13 +1,6 @@
 # GHIST+
 
-GHIST+ predicts single-cell spatial gene expression from H&E histology. The
-three main innovations are:
-
-- **VQ**: vector quantisation for compact histology-expression patterns.
-- **ECRM**: expression-cell relationship modelling for neighbourhood-aware
-  prediction.
-- **Masked-aware imputation**: robust training and prediction with missing or
-  partially observed gene panels.
+GHIST+ predicts single-cell spatial gene expression from H&E histology.
 
 <p align="center">
   <img src="figures/fig1.png" alt="GHIST+ workflow overview" width="900">
