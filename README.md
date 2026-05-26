@@ -6,8 +6,6 @@ GHIST+ predicts single-cell spatial gene expression from H&E histology.
   <img src="figures/fig1.png" alt="GHIST+ workflow overview" width="900">
 </p>
 
-This repository contains the training, inference, model, and data-loading code.
-It is not packaged as a Python library; run commands from the repository root.
 
 ## Repository Layout
 
@@ -33,7 +31,7 @@ pip install tifffile imageio opencv-python pillow timm huggingface_hub torchstai
 pip install git+https://github.com/sebastianffx/stainlib.git
 ```
 
-The first run may download the UNI2-h checkpoint through the Hugging Face cache.
+The first run downloads the UNI2-h checkpoint through the Hugging Face cache.
 
 ## Example Notebook
 
