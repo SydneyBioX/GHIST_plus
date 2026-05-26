@@ -1,7 +1,6 @@
 # GHIST+
 
-GHIST+ predicts single-cell spatial gene expression from H&E histology.
-
+GHIST+ is a framework for tissue-wide reconstruction of single-cell molecular states from H&E histology
 <p align="center">
   <img src="figures/fig1.png" alt="GHIST+ workflow overview" width="900">
 </p>
