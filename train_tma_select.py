@@ -6,11 +6,9 @@ import os
 import sys
 import shutil
 import hashlib
-from typing import NamedTuple
 from types import SimpleNamespace
 import inspect
 import json
-import csv
 import warnings
 
 import torch
@@ -22,23 +20,18 @@ import pandas as pd
 import numpy as np
 import natsort
 
-if __package__:
-    from .dataio.dataset_input_union_tma_select import DataProcessingUnion as DataProcessing
-    from .dataio.dataset_input_tma_select import DataProcessing as DataProcessingBase
-    from .model.framework import Framework
-    from .utils.utils import *
-else:
-    from dataio.dataset_input_union_tma_select import DataProcessingUnion as DataProcessing
-    from dataio.dataset_input_tma_select import DataProcessing as DataProcessingBase
-    from model.framework import Framework
-    from utils.utils import *
-
-
-class CellGraph(NamedTuple):
-    coords: torch.Tensor
-    patch_index: torch.Tensor
-    edge_index: torch.Tensor
-    cells_per_patch: torch.Tensor
+import dataio.dataset_input_tma_select as dataset_input_tma_base
+import dataio.dataset_input_union_tma_select as dataset_input_tma
+import dataio.references as reference_utils
+import dataio.samplers as sampler_utils
+import dataio.spatial as spatial_utils
+import dataio.tensors as tensor_utils
+import model.framework as model_framework
+import model.graph as graph_utils
+import model.panel_completion as panel_completion
+import utils.evaluation as evaluation_utils
+import utils.metrics as metric_utils
+import utils.utils as utils
 
 
 def _to_namespace(obj):
@@ -75,1230 +68,6 @@ def _write_json(path: str, payload: dict):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2, sort_keys=True)
-
-
-def _build_knn_graph(coords: torch.Tensor, patch_index: torch.Tensor, k: int) -> torch.Tensor:
-    if coords.numel() == 0 or patch_index.numel() == 0:
-        device = coords.device if coords.numel() else patch_index.device
-        return torch.zeros((2, 0), dtype=torch.long, device=device)
-
-    edges = []
-    unique_patches = torch.unique(patch_index, sorted=True)
-    for pid in unique_patches:
-        idx = torch.where(patch_index == pid)[0]
-        n = idx.numel()
-        if n <= 1:
-            continue
-        coords_patch = coords[idx]
-        dist = torch.cdist(coords_patch, coords_patch, p=2)
-        dist.fill_diagonal_(float("inf"))
-        k_eff = min(max(int(k), 1), n - 1)
-        if k_eff <= 0:
-            continue
-        nbr = dist.topk(k_eff, largest=False).indices
-        src = idx.unsqueeze(1).expand(-1, k_eff)
-        dst = idx[nbr]
-        edges.append(torch.stack([src.reshape(-1), dst.reshape(-1)], dim=0))
-
-    if edges:
-        return torch.cat(edges, dim=1)
-    device = coords.device if coords.numel() else patch_index.device
-    return torch.zeros((2, 0), dtype=torch.long, device=device)
-
-
-class _InterleavedSlideBatchSampler:
-    """
-    Keep each batch slide-pure while interleaving slide batches across the epoch.
-
-    This preserves the per-slide avgexp assumption used later in training while
-    preventing AdamW from seeing long same-slide blocks.
-    """
-
-    def __init__(
-        self,
-        datasets,
-        batch_size: int,
-        seed: int = 0,
-        shuffle_within_slide: bool = True,
-        shuffle_slide_order: bool = True,
-        slide_weights=None,
-        weight_cap: float = 0.0,
-    ):
-        self.batch_size = int(batch_size)
-        self.seed = int(seed)
-        self.shuffle_within_slide = bool(shuffle_within_slide)
-        self.shuffle_slide_order = bool(shuffle_slide_order)
-        self.slide_weights = list(slide_weights) if slide_weights is not None else None
-        self.weight_cap = float(weight_cap)
-        self.offsets = []
-        self.lengths = []
-        acc = 0
-        for ds in datasets:
-            self.offsets.append(acc)
-            length = len(ds)
-            self.lengths.append(length)
-            acc += length
-        self.total_batches = sum(
-            (length + self.batch_size - 1) // self.batch_size for length in self.lengths
-        )
-        self._epoch_index = 0
-
-    def __len__(self):
-        return self.total_batches
-
-    def _sample_slide_indices(self, rng, length: int, weights):
-        if length <= 0:
-            return np.zeros((0,), dtype=np.int64)
-        if weights is None:
-            idxs = np.arange(length, dtype=np.int64)
-            if self.shuffle_within_slide and length > 1:
-                rng.shuffle(idxs)
-            return idxs
-
-        try:
-            probs = np.asarray(weights, dtype=np.float64).reshape(-1)
-        except Exception:
-            probs = None
-        if probs is None or probs.shape[0] != length:
-            idxs = np.arange(length, dtype=np.int64)
-            if self.shuffle_within_slide and length > 1:
-                rng.shuffle(idxs)
-            return idxs
-
-        probs = np.nan_to_num(probs, nan=0.0, posinf=0.0, neginf=0.0)
-        probs = np.clip(probs, a_min=0.0, a_max=None)
-        if self.weight_cap > 0:
-            probs = np.minimum(probs, self.weight_cap)
-        total = probs.sum()
-        if not np.isfinite(total) or total <= 0:
-            idxs = np.arange(length, dtype=np.int64)
-            if self.shuffle_within_slide and length > 1:
-                rng.shuffle(idxs)
-            return idxs
-
-        probs = probs / total
-        return rng.choice(length, size=length, replace=True, p=probs).astype(np.int64)
-
-    def __iter__(self):
-        rng = np.random.default_rng(self.seed + self._epoch_index)
-        self._epoch_index += 1
-
-        slide_batches = []
-        for slide_idx, (offset, length) in enumerate(zip(self.offsets, self.lengths)):
-            weights = None
-            if self.slide_weights is not None and slide_idx < len(self.slide_weights):
-                weights = self.slide_weights[slide_idx]
-            local_idxs = self._sample_slide_indices(rng, length, weights)
-            idxs = local_idxs + offset
-            batches = [
-                idxs[i : i + self.batch_size].tolist()
-                for i in range(0, length, self.batch_size)
-            ]
-            slide_batches.append(batches)
-
-        positions = [0] * len(slide_batches)
-        active = [i for i, batches in enumerate(slide_batches) if batches]
-        while active:
-            round_order = list(active)
-            if self.shuffle_slide_order and len(round_order) > 1:
-                rng.shuffle(round_order)
-            next_active = []
-            for slide_idx in round_order:
-                pos = positions[slide_idx]
-                batches = slide_batches[slide_idx]
-                if pos >= len(batches):
-                    continue
-                yield batches[pos]
-                positions[slide_idx] += 1
-                if positions[slide_idx] < len(batches):
-                    next_active.append(slide_idx)
-            active = next_active
-
-
-def _build_knn_graph_global(coords: torch.Tensor, k: int) -> torch.Tensor:
-    if coords.numel() == 0:
-        return torch.zeros((2, 0), dtype=torch.long, device=coords.device)
-    n = int(coords.shape[0])
-    if n <= 1:
-        return torch.zeros((2, 0), dtype=torch.long, device=coords.device)
-    dist = torch.cdist(coords, coords, p=2)
-    dist.fill_diagonal_(float("inf"))
-    k_eff = min(max(int(k), 1), n - 1)
-    nbr = dist.topk(k_eff, largest=False).indices
-    src = torch.arange(n, device=coords.device).unsqueeze(1).expand(-1, k_eff)
-    dst = nbr
-    return torch.stack([src.reshape(-1), dst.reshape(-1)], dim=0)
-
-
-def _coalesce_edges(edge_index: torch.Tensor, n_nodes: int) -> torch.Tensor:
-    if edge_index is None or edge_index.numel() == 0:
-        return torch.zeros((2, 0), dtype=torch.long, device=edge_index.device if edge_index is not None else "cpu")
-    src = edge_index[0].long()
-    dst = edge_index[1].long()
-    valid = (src >= 0) & (src < n_nodes) & (dst >= 0) & (dst < n_nodes)
-    src = src[valid]
-    dst = dst[valid]
-    if src.numel() == 0:
-        return torch.zeros((2, 0), dtype=torch.long, device=edge_index.device)
-    key = src * n_nodes + dst
-    perm = torch.argsort(key)
-    key_sorted = key[perm]
-    keep = torch.ones_like(key_sorted, dtype=torch.bool)
-    keep[1:] = key_sorted[1:] != key_sorted[:-1]
-    uniq_idx = perm[keep]
-    return torch.stack([src[uniq_idx], dst[uniq_idx]], dim=0)
-
-
-def build_cell_graph(
-    nuclei_batch: torch.Tensor,
-    patch_ids_batch: torch.Tensor,
-    k_neighbors: int,
-    coords_batch: torch.Tensor | None = None,
-    cell_coord_map: dict | None = None,
-    cross_patch: bool = False,
-    cross_patch_k: int | None = None,
-) -> CellGraph:
-    """
-    Construct per-cell centroids and an intra-patch kNN graph so ECRM can mix
-    logits at the cell granularity. The order of cells follows the sorted nuclei
-    IDs to stay aligned with batch_ct/batch_expr tensors.
-    """
-    device = nuclei_batch.device
-    B, H, W = nuclei_batch.shape
-    coords_list = []
-    patch_assign_list = []
-    cells_per_patch = []
-    coords_batch_valid_global = (
-        isinstance(coords_batch, torch.Tensor)
-        and coords_batch.ndim == 3
-        and coords_batch.shape[0] == B
-        and coords_batch.shape[2] >= 2
-    )
-    has_coord_map = isinstance(cell_coord_map, dict) and len(cell_coord_map) > 0
-    has_global_coords = coords_batch_valid_global or has_coord_map
-
-    yy = torch.arange(H, device=device, dtype=torch.float32).view(H, 1).expand(H, W)
-    xx = torch.arange(W, device=device, dtype=torch.float32).view(1, W).expand(H, W)
-
-    for b in range(B):
-        mask = nuclei_batch[b]
-        ids = torch.unique(mask, sorted=True)
-        ids = ids[ids > 0]
-        n_valid = int(ids.numel())
-        cells_per_patch.append(n_valid)
-        if n_valid == 0:
-            continue
-
-        local_rank = 0
-
-        for cid in ids:
-            c_mask = (mask == cid)
-            area = c_mask.sum()
-            if area.item() == 0:
-                continue
-            cid_int = int(cid.item())
-            if has_coord_map and cid_int in cell_coord_map:
-                cyx = cell_coord_map[cid_int]
-                cy = torch.tensor(float(cyx[0]), dtype=torch.float32, device=device)
-                cx = torch.tensor(float(cyx[1]), dtype=torch.float32, device=device)
-            elif coords_batch_valid_global:
-                if local_rank < coords_batch.shape[1]:
-                    cxy = coords_batch[b, local_rank, :2].float().to(device)
-                    cy = cxy[1]
-                    cx = cxy[0]
-                else:
-                    c_mask = c_mask.float()
-                    area = area.float()
-                    cy = (c_mask * yy).sum() / area
-                    cx = (c_mask * xx).sum() / area
-                    cy = (cy / max(H - 1, 1)) * 2 - 1
-                    cx = (cx / max(W - 1, 1)) * 2 - 1
-            else:
-                c_mask = c_mask.float()
-                area = area.float()
-                cy = (c_mask * yy).sum() / area
-                cx = (c_mask * xx).sum() / area
-                cy = (cy / max(H - 1, 1)) * 2 - 1
-                cx = (cx / max(W - 1, 1)) * 2 - 1
-            coords_list.append(torch.stack([cy, cx]))
-            patch_assign_list.append(torch.tensor(b, dtype=torch.long, device=device))
-            local_rank += 1
-
-    if coords_list:
-        coords = torch.stack(coords_list, dim=0)
-        patch_index = torch.stack(patch_assign_list, dim=0)
-    else:
-        coords = torch.zeros((0, 2), device=device)
-        patch_index = torch.zeros((0,), dtype=torch.long, device=device)
-
-    edge_index = _build_knn_graph(coords, patch_index, k_neighbors)
-    if cross_patch and has_global_coords and coords.shape[0] > 1:
-        k_cross = int(cross_patch_k) if cross_patch_k is not None else int(k_neighbors)
-        edge_cross = _build_knn_graph_global(coords, k_cross)
-        edge_index = torch.cat([edge_index, edge_cross], dim=1)
-        edge_index = _coalesce_edges(edge_index, n_nodes=int(coords.shape[0]))
-    cells_per_patch_tensor = torch.tensor(
-        cells_per_patch if cells_per_patch else [0] * B,
-        dtype=torch.long,
-        device=device,
-    )
-    return CellGraph(coords, patch_index, edge_index, cells_per_patch_tensor)
-
-
-def _morans_many(expr: np.ndarray, coords: np.ndarray, k: int = 8) -> np.ndarray:
-    """
-    Compute Moran’s I for all genes at once on a kNN graph.
-
-    expr:  (N, G) float32
-    coords:(N, 2) float32 (pixel coords; any consistent scale is fine)
-    """
-    from scipy.spatial import cKDTree
-
-    if expr.ndim != 2 or coords.ndim != 2 or coords.shape[0] != expr.shape[0]:
-        raise ValueError("expr/coords shape mismatch for Moran's I")
-    n_cells, n_genes = expr.shape
-    if n_cells < 3:
-        return np.zeros((n_genes,), dtype=np.float64)
-
-    k_eff = max(1, min(int(k), n_cells - 1))
-    tree = cKDTree(coords.astype(np.float32, copy=False))
-    idx = tree.query(coords, k=k_eff + 1)[1][:, 1:]  # (N,k)
-
-    vc = expr.astype(np.float32, copy=False) - expr.mean(axis=0, keepdims=True)
-    den = (vc**2).sum(axis=0).astype(np.float64)  # (G,)
-    # (N,k,G) -> (G,)
-    neigh = vc[idx, :]
-    num = (vc[:, None, :] * neigh).sum(axis=(0, 1)).astype(np.float64)
-    w = float(k_eff * n_cells)
-    with np.errstate(divide="ignore", invalid="ignore"):
-        I = (n_cells / w) * (num / den)
-        I[~np.isfinite(I)] = 0.0
-        I[den <= 0] = 0.0
-    return I
-
-
-def giotto_rank_scores(expr, coords, k=8):
-    """
-    Giotto "rank" analog:
-      1) rank expression per gene
-      2) compute neighbourhood-mean rank on kNN graph
-      3) score = corr(centered ranks, centered neigh-mean ranks)
-    """
-    from scipy.spatial import cKDTree
-    from scipy.stats import rankdata
-
-    expr = np.asarray(expr, dtype=np.float32)
-    coords = np.asarray(coords, dtype=np.float32)
-    if expr.ndim != 2 or coords.ndim != 2 or expr.shape[0] != coords.shape[0]:
-        raise ValueError("giotto_rank_scores expects expr (N,G) and coords (N,2)")
-    n_cells, n_genes = expr.shape
-    if n_cells < 3 or n_genes <= 0:
-        return np.zeros((max(n_genes, 0),), dtype=np.float32)
-
-    k_eff = max(1, min(int(k), n_cells - 1))
-    tree = cKDTree(coords)
-    neigh_idx = tree.query(coords, k=k_eff + 1)[1][:, 1:]  # drop self
-
-    scores = np.zeros(n_genes, dtype=np.float32)
-    for g in range(n_genes):
-        ranks = rankdata(expr[:, g], method="average").astype(np.float32)
-        neigh_mean = ranks[neigh_idx].mean(axis=1)
-        r_center = ranks - ranks.mean()
-        n_center = neigh_mean - neigh_mean.mean()
-        denom = np.sqrt((r_center**2).sum() * (n_center**2).sum())
-        if denom > 0:
-            scores[g] = float(np.dot(r_center, n_center) / denom)
-    return scores
-
-
-def _resolve_divisions_fold(opts_regions, fold_id: int):
-    if opts_regions is None:
-        return None
-    divisions = getattr(opts_regions, "divisions", None)
-    if not isinstance(divisions, (list, tuple)) or len(divisions) == 0:
-        return None
-    idx = max(0, min(int(fold_id) - 1, len(divisions) - 1))
-    div = divisions[idx]
-    if not isinstance(div, (list, tuple)) or len(div) < 2:
-        return None
-    try:
-        return float(div[0]), float(div[1])
-    except Exception:
-        return None
-
-
-def _read_image_hw(fp_img: str):
-    try:
-        import tifffile
-
-        with tifffile.TiffFile(fp_img) as tf:
-            shape = tf.series[0].shape
-        if len(shape) == 2:
-            return int(shape[0]), int(shape[1])
-        if len(shape) >= 3:
-            if int(shape[0]) <= 5:
-                return int(shape[1]), int(shape[2])
-            return int(shape[0]), int(shape[1])
-    except Exception:
-        pass
-    img = load_image(fp_img)
-    return int(img.shape[0]), int(img.shape[1])
-
-
-def _select_region_rows(y_coords: np.ndarray, whole_h: int, divisions_fold, mode: str):
-    if divisions_fold is None:
-        return np.ones(y_coords.shape[0], dtype=bool)
-    div_a = int(round(float(divisions_fold[0]) * whole_h))
-    div_b = int(round(float(divisions_fold[1]) * whole_h))
-    in_band = (y_coords >= div_a) & (y_coords < div_b)
-    if str(mode).lower() == "train":
-        return ~in_band
-    return in_band
-
-
-def _compute_svg_rank_gene_indices_by_slide(
-    sources,
-    regions_obj,
-    fold_id: int,
-    mode_name: str,
-    gene_names,
-    *,
-    k_neighbors: int = 8,
-    sample_cap: int = 3000,
-):
-    """
-    Precompute per-slide Giotto-ranked gene index orders once per run.
-    """
-    ranks_by_slide = {}
-    divisions_fold = _resolve_divisions_fold(regions_obj, fold_id)
-
-    for src in sources:
-        slide_id = int(getattr(src, "slide_idx", -1))
-        fp_expr = getattr(src, "fp_expr", None)
-        if fp_expr is None or not os.path.isfile(fp_expr):
-            logging.warning("SVG rank skipped for slide %s: missing fp_expr", slide_id)
-            continue
-
-        try:
-            df_expr = pd.read_csv(fp_expr, index_col=0).reindex(columns=gene_names)
-        except Exception as exc:
-            logging.warning("SVG rank skipped for slide %s: failed reading expr (%s)", slide_id, exc)
-            continue
-
-        try:
-            df_expr.index = pd.to_numeric(df_expr.index, errors="coerce").astype("Int64")
-            df_expr = df_expr[~df_expr.index.isna()]
-            df_expr.index = df_expr.index.astype(np.int64)
-        except Exception:
-            pass
-
-        if df_expr.empty:
-            logging.warning("SVG rank skipped for slide %s: empty expression table", slide_id)
-            continue
-
-        coord_map = _load_histology_coord_map_from_source(src)
-        coords_df = None
-        if coord_map:
-            coords_df = pd.DataFrame.from_dict(coord_map, orient="index", columns=["y", "x"])
-            coords_df.index = pd.to_numeric(coords_df.index, errors="coerce")
-            coords_df = coords_df[~coords_df.index.isna()]
-            coords_df.index = coords_df.index.astype(np.int64)
-
-        if coords_df is None or coords_df.empty:
-            # Fallback to segmentation-centroid extraction if coordinate table is unavailable.
-            fp_seg = getattr(src, "fp_nuc_seg", None)
-            if fp_seg is None or not os.path.isfile(fp_seg):
-                logging.warning("SVG rank skipped for slide %s: no coords and no fp_nuc_seg", slide_id)
-                continue
-            ids_all = df_expr.index.to_numpy(dtype=np.int64, copy=False)
-            if ids_all.size == 0:
-                continue
-            rng = np.random.default_rng(1701 + slide_id * 10007 + int(fold_id))
-            sample_n = min(int(sample_cap), int(ids_all.size))
-            ids_pick = (
-                rng.choice(ids_all, size=sample_n, replace=False)
-                if sample_n < ids_all.size
-                else ids_all
-            )
-            kept_ids, coords_yx = _centroids_from_label_image(fp_seg, ids_pick, chunk_rows=256)
-            if kept_ids.size < 3:
-                logging.warning("SVG rank skipped for slide %s: too few centroid-matched cells", slide_id)
-                continue
-            idx = pd.Index(kept_ids.astype(np.int64))
-            expr_arr = df_expr.reindex(idx).to_numpy(dtype=np.float32)
-            coords_arr = coords_yx.astype(np.float32, copy=False)
-            fp_hist = getattr(src, "fp_hist", None)
-            if fp_hist and os.path.isfile(fp_hist):
-                whole_h, _ = _read_image_hw(fp_hist)
-                keep_region = _select_region_rows(
-                    coords_arr[:, 0],
-                    whole_h,
-                    divisions_fold,
-                    mode_name,
-                )
-                expr_arr = expr_arr[keep_region]
-                coords_arr = coords_arr[keep_region]
-        else:
-            idx = df_expr.index.intersection(coords_df.index)
-            if idx.empty:
-                logging.warning("SVG rank skipped for slide %s: no expr/coord overlap", slide_id)
-                continue
-            expr_arr = df_expr.loc[idx].to_numpy(dtype=np.float32)
-            coords_arr = coords_df.loc[idx, ["y", "x"]].to_numpy(dtype=np.float32)
-
-            # Region filter (same semantics as dataset split).
-            fp_hist = getattr(src, "fp_hist", None)
-            if fp_hist and os.path.isfile(fp_hist):
-                whole_h, _ = _read_image_hw(fp_hist)
-                keep_region = _select_region_rows(
-                    coords_arr[:, 0],
-                    whole_h,
-                    divisions_fold,
-                    mode_name,
-                )
-                expr_arr = expr_arr[keep_region]
-                coords_arr = coords_arr[keep_region]
-
-            if coords_arr.shape[0] > sample_cap:
-                rng = np.random.default_rng(1701 + slide_id * 10007 + int(fold_id))
-                keep = rng.choice(coords_arr.shape[0], size=int(sample_cap), replace=False)
-                expr_arr = expr_arr[keep]
-                coords_arr = coords_arr[keep]
-
-        if expr_arr.shape[0] < 3:
-            logging.warning("SVG rank skipped for slide %s: <3 cells after filtering", slide_id)
-            continue
-
-        expr_arr = np.nan_to_num(expr_arr, nan=0.0, posinf=0.0, neginf=0.0)
-        try:
-            scores = giotto_rank_scores(expr_arr, coords_arr, k=k_neighbors)
-        except Exception as exc:
-            logging.warning("SVG rank failed for slide %s: %s", slide_id, exc)
-            continue
-        scores = np.nan_to_num(scores.astype(np.float64), nan=-np.inf, posinf=-np.inf, neginf=-np.inf)
-        order = np.argsort(-scores, kind="stable").astype(np.int64)
-        ranks_by_slide[slide_id] = order
-
-    return ranks_by_slide
-
-
-def _summarize_gene_pcc_distribution(corr: np.ndarray):
-    vals = np.asarray(corr, dtype=np.float64)
-    vals = vals[np.isfinite(vals)]
-    if vals.size == 0:
-        return {
-            "median": float("nan"),
-            "max": float("nan"),
-            "min": float("nan"),
-            "n_genes": 0,
-        }
-    return {
-        "median": float(np.median(vals)),
-        "max": float(np.max(vals)),
-        "min": float(np.min(vals)),
-        "n_genes": int(vals.size),
-    }
-
-
-def _format_gene_pcc_triplet(stats: dict):
-    if not isinstance(stats, dict):
-        return "med=nan max=nan min=nan n=0"
-    med = stats.get("median", float("nan"))
-    mx = stats.get("max", float("nan"))
-    mn = stats.get("min", float("nan"))
-    n = int(stats.get("n_genes", 0) or 0)
-    return "med={:.4f} max={:.4f} min={:.4f} n={}".format(
-        float(med) if med is not None else float("nan"),
-        float(mx) if mx is not None else float("nan"),
-        float(mn) if mn is not None else float("nan"),
-        n,
-    )
-
-
-def _log_gene_pcc_epoch(metrics: dict, *, split_tag: str, epoch: int, svg_topk=(20, 50)):
-    if not isinstance(metrics, dict):
-        return
-    dist = metrics.get("gene_pcc_distribution_per_slide") or {}
-    if not isinstance(dist, dict) or len(dist) == 0:
-        logging.info("%s GenePCC epoch=%d: unavailable", split_tag, int(epoch))
-        return
-    for sid in sorted(dist):
-        sid_stats = dist.get(sid) or {}
-        all_s = _format_gene_pcc_triplet(sid_stats.get("all", {}))
-        parts = [f"ALL({all_s})"]
-        for k_svg in svg_topk:
-            key = f"svg{int(k_svg)}"
-            parts.append(f"SVG{int(k_svg)}({_format_gene_pcc_triplet(sid_stats.get(key, {}))})")
-        logging.info(
-            "%s GenePCC epoch=%d slide=%s %s",
-            str(split_tag).upper(),
-            int(epoch),
-            sid,
-            " ".join(parts),
-        )
-
-
-def _centroids_from_label_image(
-    fp_label_tif: str,
-    cell_ids: np.ndarray,
-    *,
-    chunk_rows: int = 256,
-) -> tuple[np.ndarray, np.ndarray]:
-    """
-    Compute centroids (y,x) for a subset of labels in a label TIFF efficiently.
-
-    Returns:
-      (kept_cell_ids, coords_yx) where coords_yx is float32 (N,2) in pixel units.
-    """
-    import tifffile
-
-    cell_ids = np.asarray(cell_ids, dtype=np.int64)
-    cell_ids = cell_ids[cell_ids > 0]
-    if cell_ids.size == 0:
-        return cell_ids, np.zeros((0, 2), dtype=np.float32)
-
-    lab = tifffile.memmap(fp_label_tif)
-    h, w = lab.shape
-    # Avoid scanning the whole TIFF to find lab.max(); we only need to map the
-    # labels we care about, and we can ignore out-of-range labels while scanning.
-    max_label = int(cell_ids.max())
-
-    # Map only requested labels -> compact 0..N-1 indices (fast filtering while scanning).
-    idx_map = np.full(max_label + 1, -1, dtype=np.int32)
-    idx_map[cell_ids] = np.arange(cell_ids.size, dtype=np.int32)
-
-    counts = np.zeros(cell_ids.size, dtype=np.int64)
-    sum_x = np.zeros(cell_ids.size, dtype=np.float64)
-    sum_y = np.zeros(cell_ids.size, dtype=np.float64)
-
-    for y0 in range(0, h, int(chunk_rows)):
-        block = np.asarray(lab[y0 : y0 + int(chunk_rows)])
-        # Map only labels within 0..max_label; anything larger is irrelevant (-1).
-        inrange = block <= max_label
-        if not np.any(inrange):
-            continue
-        mapped = np.full(block.shape, -1, dtype=np.int32)
-        mapped[inrange] = idx_map[block[inrange]]
-        valid = mapped >= 0
-        if not np.any(valid):
-            continue
-        ys, xs = np.nonzero(valid)
-        idx = mapped[ys, xs].astype(np.int64)
-        counts += np.bincount(idx, minlength=cell_ids.size)
-        sum_x += np.bincount(idx, weights=xs.astype(np.float64), minlength=cell_ids.size)
-        sum_y += np.bincount(
-            idx, weights=(ys.astype(np.float64) + float(y0)), minlength=cell_ids.size
-        )
-
-    keep = counts > 0
-    kept_ids = cell_ids[keep]
-    coords = np.stack([sum_y[keep] / counts[keep], sum_x[keep] / counts[keep]], axis=1).astype(
-        np.float32
-    )
-    return kept_ids, coords
-
-
-def flatten_expr_mask(mask_batch: torch.Tensor, n_cells_batch: torch.Tensor):
-    """
-    Collapse a per-patch expression mask (B, max_cells, n_genes) to a per-cell
-    mask aligned with concatenated outputs shaped (total_cells, n_genes).
-    """
-    if mask_batch is None:
-        return None
-    if mask_batch.ndim == 2:
-        return mask_batch
-
-    device = mask_batch.device
-    n_genes = mask_batch.shape[-1]
-    n_cells_flat = n_cells_batch.view(-1)
-    masks = []
-    for idx in range(mask_batch.shape[0]):
-        n_valid = int(n_cells_flat[idx].item()) if idx < n_cells_flat.numel() else 0
-        if n_valid <= 0:
-            continue
-        masks.append(mask_batch[idx, :n_valid, :])
-    if masks:
-        return torch.cat(masks, dim=0)
-    return torch.zeros((0, n_genes), device=device, dtype=mask_batch.dtype)
-
-
-def flatten_expr(expr_batch: torch.Tensor, n_cells_batch: torch.Tensor):
-    """
-    Collapse a per-patch expression tensor (B, max_cells, n_genes) to a per-cell
-    tensor aligned with concatenated outputs shaped (total_cells, n_genes).
-    """
-    if expr_batch is None:
-        return None
-    if expr_batch.ndim == 2:
-        return expr_batch
-
-    device = expr_batch.device
-    n_genes = expr_batch.shape[-1]
-    n_cells_flat = n_cells_batch.view(-1)
-    exprs = []
-    for idx in range(expr_batch.shape[0]):
-        n_valid = int(n_cells_flat[idx].item()) if idx < n_cells_flat.numel() else 0
-        if n_valid <= 0:
-            continue
-        exprs.append(expr_batch[idx, :n_valid, :])
-    if exprs:
-        return torch.cat(exprs, dim=0)
-    return torch.zeros((0, n_genes), device=device, dtype=expr_batch.dtype)
-
-
-def _load_histology_coord_map_from_source(src_obj):
-    """
-    Load a mapping {id_histology: (y_coord, x_coord)} when available.
-    Uses matched nuclei CSV (`fp_nuc_sizes`) + `cell_coords.csv` in the same folder.
-    """
-    fp_match = getattr(src_obj, "fp_nuc_sizes", None)
-    if fp_match is None or not os.path.isfile(fp_match):
-        return {}
-
-    fp_coords = os.path.join(os.path.dirname(fp_match), "cell_coords.csv")
-    if not os.path.isfile(fp_coords):
-        return {}
-
-    try:
-        df_match = pd.read_csv(fp_match)
-        if not {"id_histology", "id_xenium"}.issubset(set(df_match.columns)):
-            return {}
-        df_coords = pd.read_csv(fp_coords)
-        id_col = next((c for c in ("cell_id", "id_xenium", "id") if c in df_coords.columns), None)
-        x_col = next((c for c in ("x_coord", "x", "X") if c in df_coords.columns), None)
-        y_col = next((c for c in ("y_coord", "y", "Y") if c in df_coords.columns), None)
-        if id_col is None or x_col is None or y_col is None:
-            return {}
-
-        left = df_match[["id_histology", "id_xenium"]].copy()
-        right = df_coords[[id_col, x_col, y_col]].copy()
-        left["id_histology"] = pd.to_numeric(left["id_histology"], errors="coerce")
-        left["id_xenium"] = pd.to_numeric(left["id_xenium"], errors="coerce")
-        right[id_col] = pd.to_numeric(right[id_col], errors="coerce")
-        right[x_col] = pd.to_numeric(right[x_col], errors="coerce")
-        right[y_col] = pd.to_numeric(right[y_col], errors="coerce")
-        merged = left.merge(right, left_on="id_xenium", right_on=id_col, how="inner")
-        merged = merged.dropna(subset=["id_histology", x_col, y_col])
-        if merged.empty:
-            return {}
-
-        coord_map = {}
-        for r in merged.itertuples(index=False):
-            hid = int(getattr(r, "id_histology"))
-            xv = float(getattr(r, x_col))
-            yv = float(getattr(r, y_col))
-            coord_map[hid] = (yv, xv)
-        return coord_map
-    except Exception:
-        return {}
-
-
-def _load_ct_series_for_classes(fp_ct, classes):
-    if fp_ct is None or not os.path.isfile(fp_ct):
-        return None
-
-    df_ct = pd.read_csv(fp_ct, index_col="c_id")
-    ct_numeric = pd.to_numeric(df_ct["ct"], errors="coerce")
-    is_all_numbers = ct_numeric.notna().all()
-    unassigned_idx = (
-        classes.index("Unassigned")
-        if any(str(c).strip().lower() == "unassigned" for c in classes)
-        else (len(classes) - 1)
-    )
-    if not is_all_numbers:
-        ct_dict = {name: idx for idx, name in enumerate(classes)}
-        mapped = (
-            df_ct["ct"]
-            .astype(str)
-            .str.strip()
-            .map(ct_dict)
-            .fillna(unassigned_idx)
-            .astype(int)
-        )
-        return mapped
-
-    ct_vals = ct_numeric.astype(int)
-    if ct_vals.min() >= 1 and ct_vals.max() <= len(classes):
-        ct_vals = ct_vals - 1
-    return ct_vals.clip(lower=0, upper=len(classes) - 1)
-
-
-def _source_domain_id(src):
-    try:
-        return int(getattr(src, "domain_id", 0))
-    except (TypeError, ValueError):
-        return 0
-
-
-def build_avgexp_df_by_slide(
-    all_sources,
-    stats_sources,
-    gene_names,
-    classes,
-    expr_scale: float,
-    *,
-    holdout_mask_by_slide=None,
-    expr_per_source=None,
-    domain_specific: bool = False,
-):
-    """
-    Build per-slide avgexp priors directly from raw expression + cell-type files.
-
-    `all_sources` defines which slides receive a prior; `stats_sources` defines
-    which slides contribute statistics. Keeping `stats_sources` train/val only
-    preserves leak-free priors for test-time use while still allowing a union
-    panel over all known sources.
-
-    When `domain_specific` is enabled, each target slide uses cell-type priors
-    estimated from train/val slides with the same `domain_id`. If a domain has
-    no train/val statistics for a gene/cell-type, the code falls back to the
-    global train/val statistic for that missing entry.
-    """
-    if not all_sources or not stats_sources or not gene_names or not classes:
-        return {}
-
-    holdout_mask_by_slide = holdout_mask_by_slide or {}
-    expr_per_source = expr_per_source or {}
-
-    n_classes_local = len(classes)
-    n_genes_local = len(gene_names)
-    slide_ct_sums_map = {}
-    slide_ct_counts_map = {}
-    global_ct_sums = np.zeros((n_classes_local, n_genes_local), dtype=np.float64)
-    global_ct_counts = np.zeros((n_classes_local, n_genes_local), dtype=np.int64)
-    domain_ct_sums_map = {}
-    domain_ct_counts_map = {}
-
-    for src in stats_sources:
-        slide_id = int(getattr(src, "slide_idx", -1))
-        domain_id = _source_domain_id(src)
-        fp_expr_key = getattr(src, "fp_expr", None)
-        if fp_expr_key is None or not os.path.isfile(fp_expr_key):
-            continue
-        ct_series_tmp = _load_ct_series_for_classes(getattr(src, "fp_cell_type", None), classes)
-        if ct_series_tmp is None:
-            continue
-        if fp_expr_key in expr_per_source:
-            df_expr_raw = expr_per_source[fp_expr_key].reindex(columns=gene_names)
-        else:
-            df_expr_raw = pd.read_csv(fp_expr_key, index_col=0).reindex(columns=gene_names)
-        try:
-            df_expr_raw.index = df_expr_raw.index.astype(int)
-        except Exception:
-            pass
-        try:
-            ct_series_tmp.index = ct_series_tmp.index.astype(int)
-        except Exception:
-            pass
-        idx = df_expr_raw.index.intersection(ct_series_tmp.index)
-        if idx.empty:
-            continue
-        expr_arr = df_expr_raw.loc[idx].to_numpy(dtype=np.float64)
-        expr_arr = np.log1p(np.clip(expr_arr, 0.0, None)) * float(expr_scale)
-        ct_arr = ct_series_tmp.loc[idx].to_numpy(dtype=np.int64)
-        sums = np.zeros((n_classes_local, n_genes_local), dtype=np.float64)
-        counts = np.zeros((n_classes_local, n_genes_local), dtype=np.int64)
-        valid_mask = np.isfinite(expr_arr)
-        for ct_val in np.unique(ct_arr):
-            if ct_val < 0 or ct_val >= n_classes_local:
-                continue
-            rows = ct_arr == ct_val
-            if not rows.any():
-                continue
-            expr_rows = expr_arr[rows]
-            valid_rows = valid_mask[rows]
-            sums[ct_val] += np.nansum(np.where(valid_rows, expr_rows, 0.0), axis=0)
-            counts[ct_val] += valid_rows.sum(axis=0)
-        slide_ct_sums_map[slide_id] = sums
-        slide_ct_counts_map[slide_id] = counts
-        global_ct_sums += sums
-        global_ct_counts += counts
-        if domain_specific:
-            if domain_id not in domain_ct_sums_map:
-                domain_ct_sums_map[domain_id] = np.zeros_like(global_ct_sums)
-                domain_ct_counts_map[domain_id] = np.zeros_like(global_ct_counts)
-            domain_ct_sums_map[domain_id] += sums
-            domain_ct_counts_map[domain_id] += counts
-
-    if not slide_ct_sums_map:
-        return {}
-
-    with np.errstate(divide="ignore", invalid="ignore"):
-        global_ct_means = np.full_like(global_ct_sums, np.nan, dtype=np.float64)
-        np.divide(
-            global_ct_sums,
-            global_ct_counts,
-            out=global_ct_means,
-            where=global_ct_counts > 0,
-        )
-
-    gene_sums_global = global_ct_sums.sum(axis=0)
-    gene_counts_global = global_ct_counts.sum(axis=0)
-    with np.errstate(divide="ignore", invalid="ignore"):
-        gene_mean_global = np.full_like(gene_sums_global, np.nan, dtype=np.float64)
-        np.divide(
-            gene_sums_global,
-            gene_counts_global,
-            out=gene_mean_global,
-            where=gene_counts_global > 0,
-        )
-    gene_mean_global = np.where(np.isfinite(gene_mean_global), gene_mean_global, 0.0)
-
-    domain_ct_means_map = {}
-    domain_gene_mean_map = {}
-    if domain_specific:
-        for domain_id, domain_sums in domain_ct_sums_map.items():
-            domain_counts = domain_ct_counts_map[domain_id]
-            with np.errstate(divide="ignore", invalid="ignore"):
-                domain_means = np.full_like(domain_sums, np.nan, dtype=np.float64)
-                np.divide(
-                    domain_sums,
-                    domain_counts,
-                    out=domain_means,
-                    where=domain_counts > 0,
-                )
-            domain_gene_sums = domain_sums.sum(axis=0)
-            domain_gene_counts = domain_counts.sum(axis=0)
-            with np.errstate(divide="ignore", invalid="ignore"):
-                domain_gene_mean = np.full_like(domain_gene_sums, np.nan, dtype=np.float64)
-                np.divide(
-                    domain_gene_sums,
-                    domain_gene_counts,
-                    out=domain_gene_mean,
-                    where=domain_gene_counts > 0,
-                )
-            domain_ct_means_map[domain_id] = domain_means
-            domain_gene_mean_map[domain_id] = domain_gene_mean
-
-    avgexp_df_by_slide = {}
-    for src in all_sources:
-        slide_id = int(getattr(src, "slide_idx", -1))
-        domain_id = _source_domain_id(src)
-        sums = slide_ct_sums_map.get(slide_id)
-        counts = slide_ct_counts_map.get(slide_id)
-        base_ct_sums = global_ct_sums
-        base_ct_counts = global_ct_counts
-        base_ct_means = global_ct_means
-        base_gene_mean = gene_mean_global
-        if domain_specific and domain_id in domain_ct_means_map:
-            base_ct_sums = domain_ct_sums_map[domain_id]
-            base_ct_counts = domain_ct_counts_map[domain_id]
-            base_ct_means = domain_ct_means_map[domain_id]
-            base_gene_mean = domain_gene_mean_map[domain_id]
-
-        if sums is not None and counts is not None:
-            with np.errstate(divide="ignore", invalid="ignore"):
-                slide_means = np.full_like(sums, np.nan, dtype=np.float64)
-                np.divide(sums, counts, out=slide_means, where=counts > 0)
-        else:
-            slide_means = None
-
-        ref = base_ct_means.copy()
-        present_mask = (
-            counts.sum(axis=0) > 0 if counts is not None else np.zeros(n_genes_local, dtype=bool)
-        )
-        holdout_mask = holdout_mask_by_slide.get(slide_id)
-        if holdout_mask is None:
-            holdout_mask_bool = np.zeros(n_genes_local, dtype=bool)
-        else:
-            holdout_mask_bool = np.asarray(holdout_mask, dtype=bool)
-
-        use_slide_mask = present_mask & (~holdout_mask_bool)
-        if slide_means is not None and use_slide_mask.any():
-            ref[:, use_slide_mask] = slide_means[:, use_slide_mask]
-
-        if holdout_mask_bool.any() and sums is not None and counts is not None:
-            excl_sums = base_ct_sums - sums
-            excl_counts = base_ct_counts - counts
-            with np.errstate(divide="ignore", invalid="ignore"):
-                excl_means = np.full_like(excl_sums, np.nan, dtype=np.float64)
-                np.divide(
-                    excl_sums,
-                    excl_counts,
-                    out=excl_means,
-                    where=excl_counts > 0,
-                )
-            excl_gene_sums = excl_sums.sum(axis=0)
-            excl_gene_counts = excl_counts.sum(axis=0)
-            with np.errstate(divide="ignore", invalid="ignore"):
-                excl_gene_mean = np.full_like(excl_gene_sums, np.nan, dtype=np.float64)
-                np.divide(
-                    excl_gene_sums,
-                    excl_gene_counts,
-                    out=excl_gene_mean,
-                    where=excl_gene_counts > 0,
-                )
-
-            hold_idx = np.where(holdout_mask_bool)[0]
-            excl_block = excl_means[:, hold_idx]
-            fallback = np.broadcast_to(excl_gene_mean[hold_idx], excl_block.shape)
-            excl_block = np.where(np.isfinite(excl_block), excl_block, fallback)
-            excl_block = np.where(np.isfinite(excl_block), excl_block, 0.0)
-            ref[:, hold_idx] = excl_block
-
-        ref = np.where(np.isfinite(ref), ref, global_ct_means)
-        ref = np.where(np.isfinite(ref), ref, np.broadcast_to(base_gene_mean, ref.shape))
-        ref = np.where(np.isfinite(ref), ref, np.broadcast_to(gene_mean_global, ref.shape))
-        ref = np.nan_to_num(ref, nan=0.0, posinf=0.0, neginf=0.0)
-        avgexp_df_by_slide[slide_id] = pd.DataFrame(ref, index=classes, columns=gene_names)
-
-    return avgexp_df_by_slide
-
-
-def _build_train_region_avgexp_df_by_slide(
-    src_list,
-    train_regions,
-    fold_id: int,
-    gene_names,
-    classes,
-    expr_scale: float,
-    *,
-    fallback_df_by_slide=None,
-    holdout_mask_by_slide=None,
-    domain_specific: bool = False,
-):
-    """
-    Build per-slide avgexp priors using only cells that fall inside the effective
-    training region for each slide. This is used for validation to avoid leaking
-    val-region cells into the prior that predicts the val region. If slide-level
-    holdout genes are configured, preserve the existing non-leaky behavior for
-    those genes by using leave-one-slide-out global statistics instead of the
-    same-slide prior.
-    """
-    if not src_list or not gene_names or not classes:
-        return {}
-
-    n_classes_local = len(classes)
-    n_genes_local = len(gene_names)
-    slide_ct_sums_map = {}
-    slide_ct_counts_map = {}
-    global_ct_sums = np.zeros((n_classes_local, n_genes_local), dtype=np.float64)
-    global_ct_counts = np.zeros((n_classes_local, n_genes_local), dtype=np.int64)
-    domain_ct_sums_map = {}
-    domain_ct_counts_map = {}
-
-    divisions_fold = _resolve_divisions_fold(train_regions, fold_id)
-
-    for src in src_list:
-        slide_id = int(getattr(src, "slide_idx", -1))
-        domain_id = _source_domain_id(src)
-        fp_expr = getattr(src, "fp_expr", None)
-        if fp_expr is None or not os.path.isfile(fp_expr):
-            logging.warning(
-                "Validation train-region avgexp skipped for slide %s: missing fp_expr",
-                slide_id,
-            )
-            continue
-
-        ct_series_tmp = _load_ct_series_for_classes(getattr(src, "fp_cell_type", None), classes)
-        if ct_series_tmp is None:
-            logging.warning(
-                "Validation train-region avgexp skipped for slide %s: missing fp_cell_type",
-                slide_id,
-            )
-            continue
-
-        coord_map = _load_histology_coord_map_from_source(src)
-        if not coord_map:
-            logging.warning(
-                "Validation train-region avgexp skipped for slide %s: missing coord map",
-                slide_id,
-            )
-            continue
-
-        try:
-            df_expr_raw = pd.read_csv(fp_expr, index_col=0).reindex(columns=gene_names)
-        except Exception as exc:
-            logging.warning(
-                "Validation train-region avgexp skipped for slide %s: failed to read expr (%s)",
-                slide_id,
-                exc,
-            )
-            continue
-
-        try:
-            df_expr_raw.index = df_expr_raw.index.astype(int)
-        except Exception:
-            pass
-        try:
-            ct_series_tmp.index = ct_series_tmp.index.astype(int)
-        except Exception:
-            pass
-
-        common_ids = [int(cid) for cid in df_expr_raw.index.intersection(ct_series_tmp.index)]
-        common_ids = [cid for cid in common_ids if cid in coord_map]
-        if not common_ids:
-            logging.warning(
-                "Validation train-region avgexp skipped for slide %s: no overlapping cells with coords",
-                slide_id,
-            )
-            continue
-
-        whole_h, _ = _read_image_hw(getattr(src, "fp_hist"))
-        y_coords = np.asarray([float(coord_map[cid][0]) for cid in common_ids], dtype=np.float64)
-        keep_train = _select_region_rows(y_coords, whole_h, divisions_fold, mode="train")
-        train_ids = np.asarray(common_ids, dtype=np.int64)[keep_train]
-        if train_ids.size == 0:
-            logging.warning(
-                "Validation train-region avgexp skipped for slide %s: empty train region",
-                slide_id,
-            )
-            continue
-
-        expr_arr = df_expr_raw.loc[train_ids].to_numpy(dtype=np.float64)
-        expr_arr = np.log1p(np.clip(expr_arr, 0.0, None)) * float(expr_scale)
-        ct_arr = ct_series_tmp.loc[train_ids].to_numpy(dtype=np.int64)
-
-        sums = np.zeros((n_classes_local, n_genes_local), dtype=np.float64)
-        counts = np.zeros((n_classes_local, n_genes_local), dtype=np.int64)
-        valid_mask = np.isfinite(expr_arr)
-        for ct_val in np.unique(ct_arr):
-            if ct_val < 0 or ct_val >= n_classes_local:
-                continue
-            rows = ct_arr == ct_val
-            if not rows.any():
-                continue
-            expr_rows = expr_arr[rows]
-            valid_rows = valid_mask[rows]
-            sums[ct_val] += np.nansum(np.where(valid_rows, expr_rows, 0.0), axis=0)
-            counts[ct_val] += valid_rows.sum(axis=0)
-
-        slide_ct_sums_map[slide_id] = sums
-        slide_ct_counts_map[slide_id] = counts
-        global_ct_sums += sums
-        global_ct_counts += counts
-        if domain_specific:
-            if domain_id not in domain_ct_sums_map:
-                domain_ct_sums_map[domain_id] = np.zeros_like(global_ct_sums)
-                domain_ct_counts_map[domain_id] = np.zeros_like(global_ct_counts)
-            domain_ct_sums_map[domain_id] += sums
-            domain_ct_counts_map[domain_id] += counts
-
-    if not slide_ct_sums_map:
-        return {}
-
-    with np.errstate(divide="ignore", invalid="ignore"):
-        global_ct_means = np.full_like(global_ct_sums, np.nan, dtype=np.float64)
-        np.divide(
-            global_ct_sums,
-            global_ct_counts,
-            out=global_ct_means,
-            where=global_ct_counts > 0,
-        )
-
-    gene_sums_global = global_ct_sums.sum(axis=0)
-    gene_counts_global = global_ct_counts.sum(axis=0)
-    with np.errstate(divide="ignore", invalid="ignore"):
-        gene_mean_global = np.full_like(gene_sums_global, np.nan, dtype=np.float64)
-        np.divide(
-            gene_sums_global,
-            gene_counts_global,
-            out=gene_mean_global,
-            where=gene_counts_global > 0,
-        )
-    gene_mean_global = np.where(np.isfinite(gene_mean_global), gene_mean_global, 0.0)
-
-    domain_ct_means_map = {}
-    domain_gene_mean_map = {}
-    if domain_specific:
-        for domain_id, domain_sums in domain_ct_sums_map.items():
-            domain_counts = domain_ct_counts_map[domain_id]
-            with np.errstate(divide="ignore", invalid="ignore"):
-                domain_means = np.full_like(domain_sums, np.nan, dtype=np.float64)
-                np.divide(
-                    domain_sums,
-                    domain_counts,
-                    out=domain_means,
-                    where=domain_counts > 0,
-                )
-            domain_gene_sums = domain_sums.sum(axis=0)
-            domain_gene_counts = domain_counts.sum(axis=0)
-            with np.errstate(divide="ignore", invalid="ignore"):
-                domain_gene_mean = np.full_like(domain_gene_sums, np.nan, dtype=np.float64)
-                np.divide(
-                    domain_gene_sums,
-                    domain_gene_counts,
-                    out=domain_gene_mean,
-                    where=domain_gene_counts > 0,
-                )
-            domain_ct_means_map[domain_id] = domain_means
-            domain_gene_mean_map[domain_id] = domain_gene_mean
-
-    avgexp_df_by_slide = {}
-    fallback_df_by_slide = fallback_df_by_slide or {}
-    holdout_mask_by_slide = holdout_mask_by_slide or {}
-    for src in src_list:
-        slide_id = int(getattr(src, "slide_idx", -1))
-        domain_id = _source_domain_id(src)
-        sums = slide_ct_sums_map.get(slide_id)
-        counts = slide_ct_counts_map.get(slide_id)
-        if sums is None or counts is None:
-            if slide_id in fallback_df_by_slide:
-                avgexp_df_by_slide[slide_id] = fallback_df_by_slide[slide_id]
-            continue
-
-        with np.errstate(divide="ignore", invalid="ignore"):
-            slide_means = np.full_like(sums, np.nan, dtype=np.float64)
-            np.divide(sums, counts, out=slide_means, where=counts > 0)
-
-        base_ct_sums = global_ct_sums
-        base_ct_counts = global_ct_counts
-        base_ct_means = global_ct_means
-        base_gene_mean = gene_mean_global
-        if domain_specific and domain_id in domain_ct_means_map:
-            base_ct_sums = domain_ct_sums_map[domain_id]
-            base_ct_counts = domain_ct_counts_map[domain_id]
-            base_ct_means = domain_ct_means_map[domain_id]
-            base_gene_mean = domain_gene_mean_map[domain_id]
-
-        ref = base_ct_means.copy()
-        present_mask = counts.sum(axis=0) > 0
-        holdout_mask = holdout_mask_by_slide.get(slide_id)
-        if holdout_mask is None:
-            holdout_mask_bool = np.zeros(n_genes_local, dtype=bool)
-        else:
-            holdout_mask_bool = np.asarray(holdout_mask, dtype=bool)
-
-        use_slide_mask = present_mask & (~holdout_mask_bool)
-        if use_slide_mask.any():
-            ref[:, use_slide_mask] = slide_means[:, use_slide_mask]
-
-        if holdout_mask_bool.any():
-            excl_sums = base_ct_sums - sums
-            excl_counts = base_ct_counts - counts
-            with np.errstate(divide="ignore", invalid="ignore"):
-                excl_means = np.full_like(excl_sums, np.nan, dtype=np.float64)
-                np.divide(
-                    excl_sums,
-                    excl_counts,
-                    out=excl_means,
-                    where=excl_counts > 0,
-                )
-            excl_gene_sums = excl_sums.sum(axis=0)
-            excl_gene_counts = excl_counts.sum(axis=0)
-            with np.errstate(divide="ignore", invalid="ignore"):
-                excl_gene_mean = np.full_like(excl_gene_sums, np.nan, dtype=np.float64)
-                np.divide(
-                    excl_gene_sums,
-                    excl_gene_counts,
-                    out=excl_gene_mean,
-                    where=excl_gene_counts > 0,
-                )
-
-            hold_idx = np.where(holdout_mask_bool)[0]
-            excl_block = excl_means[:, hold_idx]
-            fallback = np.broadcast_to(excl_gene_mean[hold_idx], excl_block.shape)
-            excl_block = np.where(np.isfinite(excl_block), excl_block, fallback)
-            excl_block = np.where(np.isfinite(excl_block), excl_block, 0.0)
-            ref[:, hold_idx] = excl_block
-
-        ref = np.where(np.isfinite(ref), ref, global_ct_means)
-        ref = np.where(np.isfinite(ref), ref, np.broadcast_to(base_gene_mean, ref.shape))
-        ref = np.where(np.isfinite(ref), ref, np.broadcast_to(gene_mean_global, ref.shape))
-        ref = np.nan_to_num(ref, nan=0.0, posinf=0.0, neginf=0.0)
-        avgexp_df_by_slide[slide_id] = pd.DataFrame(ref, index=classes, columns=gene_names)
-
-    return avgexp_df_by_slide
 
 
 def _punch_cache_path(base_dir: str, slide_idx: int) -> str:
@@ -1359,7 +128,12 @@ def preselect_tma_punch_with_vq(
     window_um = _as_float_attr(opts.data, ("broadcast_window_um", "roi_size_um"), 1000.0)
     pixel_um = _as_float_attr(opts.data, ("pixel_size_um",), _as_float_attr(opts.model, ("pixel_size_um",), 0.2125))
     if window_um <= 0 or pixel_um <= 0:
-        logging.warning("[punch] Invalid window_um=%.3f pixel_um=%.5f; skipping slide=%s", window_um, pixel_um, slide_idx)
+        logging.warning(
+            "[punch] Invalid window_um=%.3f pixel_um=%.5f; skipping slide=%s",
+            window_um,
+            pixel_um,
+            slide_idx,
+        )
         return
     window_px = window_um / pixel_um
 
@@ -1369,7 +143,7 @@ def preselect_tma_punch_with_vq(
         opts_stain_norm.fp_norm_ref = opts_stain_norm.fp_norm_ref[0]
 
     logging.info("[punch] Preselecting TMA punch via VQ for slide=%s", slide_idx)
-    ds = DataProcessingBase(
+    ds = dataset_input_tma_base.DataProcessing(
         src,
         opts.data,
         train_regions,
@@ -1431,7 +205,7 @@ def preselect_tma_punch_with_vq(
             patch_coords = patch_coords.to(device)
             patch_slide_idx = patch_slide_idx.to(device)
 
-            graph = build_cell_graph(
+            graph = graph_utils.build_cell_graph(
                 batch_nuclei,
                 patch_ids,
                 k_neighbors=max(int(graph_k), 2),
@@ -1527,7 +301,11 @@ def preselect_tma_punch_with_vq(
         roi_balance_target = str(getattr(opts.data, "punch_roi_balance_target", "uniform")).strip().lower()
         if roi_balance_target == "slide":
             counts_slide = np.bincount(vq_idx_all[qc_mask], minlength=k_clusters).astype(np.float32)
-            target = counts_slide / counts_slide.sum() if counts_slide.sum() > 0 else np.full((k_clusters,), 1.0 / k_clusters, dtype=np.float32)
+            target = (
+                counts_slide / counts_slide.sum()
+                if counts_slide.sum() > 0
+                else np.full((k_clusters,), 1.0 / k_clusters, dtype=np.float32)
+            )
         else:
             target = np.full((k_clusters,), 1.0 / k_clusters, dtype=np.float32)
 
@@ -1595,7 +373,13 @@ def preselect_tma_punch_with_vq(
 
         if ct_counts_all is not None and expr_mean_all is not None:
             stage2_topk = max(1, int(getattr(opts.data, "punch_stage2_topk", 25)))
-            stage2_min_ratio = float(np.clip(float(getattr(opts.data, "punch_stage2_min_stage1_ratio", 0.98)), 0.0, 1.0))
+            stage2_min_ratio = float(
+                np.clip(
+                    float(getattr(opts.data, "punch_stage2_min_stage1_ratio", 0.98)),
+                    0.0,
+                    1.0,
+                )
+            )
             subset = [c for c in candidates if c["stage1_score"] >= best["stage1_score"] * stage2_min_ratio]
             subset = subset[:stage2_topk] if len(subset) >= stage2_topk else candidates[:stage2_topk]
 
@@ -1607,7 +391,15 @@ def preselect_tma_punch_with_vq(
                         keep_ct[idx_cls] = False
                         break
             slide_ct = ct_counts_all[qc_mask].sum(axis=0).astype(np.float32)[keep_ct]
-            p_slide = slide_ct / slide_ct.sum() if slide_ct.sum() > 0 else np.full((keep_ct.sum(),), 1.0 / max(int(keep_ct.sum()), 1), dtype=np.float32)
+            p_slide = (
+                slide_ct / slide_ct.sum()
+                if slide_ct.sum() > 0
+                else np.full(
+                    (keep_ct.sum(),),
+                    1.0 / max(int(keep_ct.sum()), 1),
+                    dtype=np.float32,
+                )
+            )
             p_uniform = np.full_like(p_slide, 1.0 / max(p_slide.size, 1))
             alpha = float(np.clip(float(getattr(opts.data, "punch_stage2_ct_blend_alpha", 0.5)), 0.0, 1.0))
             p_target = (1.0 - alpha) * p_slide + alpha * p_uniform
@@ -1643,7 +435,10 @@ def preselect_tma_punch_with_vq(
             best_stage2_score = -1.0
             for cand in subset:
                 center = cand["center"]
-                in_mask = (np.abs(coords_all[:, 0] - center[0]) <= half) & (np.abs(coords_all[:, 1] - center[1]) <= half)
+                in_mask = (
+                    (np.abs(coords_all[:, 0] - center[0]) <= half)
+                    & (np.abs(coords_all[:, 1] - center[1]) <= half)
+                )
                 qc_in = in_mask & qc_mask
                 if not np.any(qc_in):
                     continue
@@ -1681,701 +476,17 @@ def preselect_tma_punch_with_vq(
         **best_meta,
     }
     torch.save(meta, cache_path)
-    logging.info("[punch] Selected slide=%s center=%s window_px=%.1f -> %s", slide_idx, meta["punch_center"], window_px, cache_path)
-
-
-class PanelCompletionHead(nn.Module):
-    """
-    Gene-conditioned imputation head ("panel completion").
-
-    Inputs (per cell):
-      - delta_obs: (expr_true - expr_ref_base) on observed genes only
-      - mask_obs:  0/1 mask for observed genes
-      - delta_morph (optional): (out_expr - expr_ref_base) as morphology residual
-
-    Output:
-      - delta_hat: predicted residual for all genes (to add on top of expr_ref_base)
-    """
-
-    def __init__(
-        self,
-        n_genes: int,
-        hidden_dim: int = 256,
-        dropout: float = 0.0,
-        use_morph: bool = True,
-        morph_gate_init: float = -2.0,
-    ):
-        super().__init__()
-        self.n_genes = int(n_genes)
-        self.use_morph = bool(use_morph)
-
-        in_dim = self.n_genes * 2  # delta_obs + mask_obs
-        self.net = nn.Sequential(
-            nn.Linear(in_dim, hidden_dim),
-            nn.GELU(),
-            nn.Dropout(p=dropout),
-            nn.Linear(hidden_dim, self.n_genes),
-        )
-        if self.use_morph:
-            self.morph_gate = nn.Parameter(
-                torch.full((self.n_genes,), float(morph_gate_init))
-            )
-        else:
-            self.register_parameter("morph_gate", None)
-
-    def forward(
-        self,
-        delta_obs: torch.Tensor,
-        mask_obs: torch.Tensor,
-        delta_morph=None,
-    ) -> torch.Tensor:
-        if delta_obs.shape[-1] != self.n_genes or mask_obs.shape[-1] != self.n_genes:
-            raise ValueError("PanelCompletionHead: gene dimension mismatch.")
-        x = torch.cat([delta_obs, mask_obs], dim=1)
-        delta_hat = self.net(x)
-        if self.use_morph and delta_morph is not None:
-            gate = torch.sigmoid(self.morph_gate).view(1, -1)
-            delta_hat = delta_hat + gate * delta_morph
-        return delta_hat
-
-
-def pearson_loss(pred, target, eps=1e-6):
-    pred = pred - pred.mean(dim=0, keepdim=True)
-    target = target - target.mean(dim=0, keepdim=True)
-    num = (pred * target).mean(dim=0)
-    denom = (
-        pred.std(dim=0, unbiased=False) * target.std(dim=0, unbiased=False)
-    ).clamp_min(eps)
-    corr = num / denom
-    return (1.0 - corr).mean()
-
-
-def masked_pearson(pred, target, mask=None, eps=1e-6):
-    """
-    Pearson distance (1 - corr) with an optional per-gene mask.
-    """
-    if mask is None:
-        return pearson_loss(pred, target, eps=eps)
-    mask = mask.float()
-    valid = mask.sum(dim=1, keepdim=True).clamp_min(1.0)
-    pred_center = (pred * mask - (pred * mask).sum(dim=1, keepdim=True) / valid)
-    targ_center = (target * mask - (target * mask).sum(dim=1, keepdim=True) / valid)
-    num = (pred_center * targ_center * mask).sum(dim=1)
-    denom = (
-        ((pred_center**2) * mask).sum(dim=1).clamp_min(eps).sqrt()
-        * ((targ_center**2) * mask).sum(dim=1).clamp_min(eps).sqrt()
-    ).clamp_min(eps)
-    corr = num / denom
-    return (1.0 - corr).mean()
-
-
-def evaluate_validation(
-    model,
-    dataloader,
-    expr_ref_torch,
-    device,
-    n_classes,
-    graph_k=None,
-    graph_cross_patch=False,
-    graph_cross_patch_k=None,
-    slide_coord_map_by_slide=None,
-    expr_ref_torch_map=None,
-    holdout_mask_by_slide=None,
-    gene_names=None,
-    epoch=None,
-    per_gene_dir=None,
-    svg_rank_gene_indices_by_slide=None,
-    svg_topk=(20, 50),
-):
-    # exposed for external quick evals
-    def masked_mse(pred, target, mask):
-        if mask is None:
-            return F.mse_loss(pred, target, reduction="mean")
-        mask = mask.float()
-        denom = mask.sum()
-        if denom <= 0:
-            return torch.tensor(0.0, device=pred.device)
-        return torch.sum((pred - target) ** 2 * mask) / denom
-
-    def masked_pearson(pred, target, mask, eps=1e-6):
-        if mask is None:
-            return pearson_loss(pred, target, eps=eps)
-        mask = mask.float()
-        valid = mask.sum(dim=1, keepdim=True).clamp_min(1.0)
-        pred_center = (pred * mask - (pred * mask).sum(dim=1, keepdim=True) / valid)
-        targ_center = (target * mask - (target * mask).sum(dim=1, keepdim=True) / valid)
-        num = (pred_center * targ_center * mask).sum(dim=1)
-        denom = (
-            ((pred_center**2) * mask).sum(dim=1).clamp_min(eps).sqrt()
-            * ((targ_center**2) * mask).sum(dim=1).clamp_min(eps).sqrt()
-        ).clamp_min(eps)
-        corr = num / denom
-        return (1.0 - corr).mean()
-    def masked_mse(pred, target, mask):
-        if mask is None:
-            return F.mse_loss(pred, target, reduction="mean")
-        mask = mask.float()
-        denom = mask.sum()
-        if denom <= 0:
-            return torch.tensor(0.0, device=pred.device)
-        return torch.sum((pred - target) ** 2 * mask) / denom
-
-    def masked_pearson(pred, target, mask, eps=1e-6):
-        if mask is None:
-            return pearson_loss(pred, target, eps=eps)
-        mask = mask.float()
-        valid = mask.sum(dim=1, keepdim=True).clamp_min(1.0)
-        pred_center = (pred * mask - (pred * mask).sum(dim=1, keepdim=True) / valid)
-        targ_center = (target * mask - (target * mask).sum(dim=1, keepdim=True) / valid)
-        num = (pred_center * targ_center * mask).sum(dim=1)
-        denom = (
-            ((pred_center**2) * mask).sum(dim=1).clamp_min(eps).sqrt()
-            * ((targ_center**2) * mask).sum(dim=1).clamp_min(eps).sqrt()
-        ).clamp_min(eps)
-        corr = num / denom
-        return (1.0 - corr).mean()
-    model.eval()
-    holdout_sse = 0.0
-    holdout_sae = 0.0
-    holdout_n = 0.0
-    ct_counts = np.zeros(n_classes, dtype=np.int64)
-    pred_counts = np.zeros(n_classes, dtype=np.int64)
-    correct_counts = np.zeros(n_classes, dtype=np.int64)
-    # per-slide class counts
-    ct_counts_per = {}
-    pred_counts_per = {}
-    correct_counts_per = {}
-    total_cells = 0
-
-    # Ensure we always have a mapping to avoid NameError when per-slide refs are missing
-    expr_ref_torch_map = expr_ref_torch_map or {}
-    svg_rank_gene_indices_by_slide = svg_rank_gene_indices_by_slide or {}
-    svg_topk = tuple(int(k) for k in (svg_topk or (20, 50)) if int(k) > 0)
-
-    # Debug: log expression variance/pearson once per validation run
-    log_debug_once = True
-
-    compute_per_gene = gene_names is not None and len(gene_names) > 0
-    per_gene_stats = {}
-    holdout_gene_stats = {}
-
-    def _get_per_gene_stats(slide_id):
-        if slide_id not in per_gene_stats:
-            n = len(gene_names)
-            per_gene_stats[slide_id] = {
-                "count": np.zeros(n, dtype=np.float64),
-                "sum_pred": np.zeros(n, dtype=np.float64),
-                "sum_targ": np.zeros(n, dtype=np.float64),
-                "sum_pred2": np.zeros(n, dtype=np.float64),
-                "sum_targ2": np.zeros(n, dtype=np.float64),
-                "sum_xy": np.zeros(n, dtype=np.float64),
-            }
-        return per_gene_stats[slide_id]
-
-    def _get_holdout_gene_stats(slide_id):
-        if slide_id not in holdout_gene_stats:
-            n = len(gene_names)
-            holdout_gene_stats[slide_id] = {
-                "count": np.zeros(n, dtype=np.float64),
-                "sum_pred": np.zeros(n, dtype=np.float64),
-                "sum_targ": np.zeros(n, dtype=np.float64),
-                "sum_pred2": np.zeros(n, dtype=np.float64),
-                "sum_targ2": np.zeros(n, dtype=np.float64),
-                "sum_xy": np.zeros(n, dtype=np.float64),
-            }
-        return holdout_gene_stats[slide_id]
-
-    try:
-        import inspect
-
-        fwd_params = inspect.signature(model.forward).parameters
-        supports_cell_graph = all(
-            k in fwd_params for k in ("coords_cells", "cell_edge_index", "cell_patch_ids")
-        )
-    except Exception:
-        supports_cell_graph = False
-
-    with torch.no_grad():
-        for (
-            batch_nuclei,
-            batch_type_patch,
-            batch_he_img,
-            batch_expr,
-            batch_n_cells,
-            batch_ct,
-            patch_ids,
-            batch_expr_mask,
-            batch_slide_id,
-        ) in dataloader:
-            batch_nuclei = batch_nuclei.to(device)
-            batch_he_img = batch_he_img.to(device)
-            batch_expr = batch_expr.to(device)
-            batch_expr_mask = batch_expr_mask.to(device)
-            batch_n_cells = batch_n_cells.to(device)
-            batch_ct = batch_ct.to(device)
-            patch_ids = patch_ids.to(device)
-            slide_ids_unique = torch.unique(batch_slide_id)
-            if slide_ids_unique.numel() != 1:
-                raise RuntimeError("Mixed slides in batch; set batch_size=1 for per-slide avgexp.")
-            slide_id_val = int(slide_ids_unique.item())
-            expr_ref_batch = expr_ref_torch_map.get(slide_id_val, expr_ref_torch)
-            model_extra_kwargs = {}
-            if supports_cell_graph:
-                coord_map_slide = None
-                if isinstance(slide_coord_map_by_slide, dict):
-                    coord_map_slide = slide_coord_map_by_slide.get(slide_id_val)
-                graph = build_cell_graph(
-                    batch_nuclei,
-                    patch_ids,
-                    k_neighbors=graph_k or 6,
-                    coords_batch=None,
-                    cell_coord_map=coord_map_slide,
-                    cross_patch=bool(graph_cross_patch),
-                    cross_patch_k=graph_cross_patch_k,
-                )
-                model_extra_kwargs = {
-                    "coords_cells": graph.coords,
-                    "cell_edge_index": graph.edge_index,
-                    "cell_patch_ids": graph.patch_index,
-                }
-
-            # Prevent leakage in validation: for slide-level held-out genes, replace GT expr
-            # with the (non-leaky) ref baseline before calling the model.
-            batch_expr_for_model = batch_expr
-            holdout_mask_vec = None
-            if holdout_mask_by_slide is not None:
-                holdout_mask_vec = holdout_mask_by_slide.get(slide_id_val)
-            if holdout_mask_vec is not None and np.any(np.asarray(holdout_mask_vec) > 0):
-                holdout_idx = torch.from_numpy(
-                    np.where(np.asarray(holdout_mask_vec) > 0.5)[0].astype(np.int64)
-                ).to(device)
-                if holdout_idx.numel() > 0:
-                    batch_expr_for_model = batch_expr.clone()
-                    n_ref_local = expr_ref_batch.shape[0] if expr_ref_batch is not None else 0
-                    for b in range(batch_expr_for_model.shape[0]):
-                        n_valid = int(batch_n_cells[b].item())
-                        if n_valid <= 0:
-                            continue
-                        if (
-                            n_ref_local > 0
-                            and batch_ct is not None
-                            and batch_ct.numel() > 0
-                        ):
-                            ct_b = batch_ct[b, :n_valid].long().clamp(min=0).clamp(max=n_ref_local - 1)
-                            baseline_all = expr_ref_batch[ct_b]
-                            batch_expr_for_model[b, :n_valid, holdout_idx] = baseline_all[:, holdout_idx]
-                        else:
-                            batch_expr_for_model[b, :n_valid, holdout_idx] = 0.0
-
-            (
-                out_cell_type,
-                out_map,
-                batch_ct_pc,
-                out_expr,
-                out_expr_immune,
-                out_expr_invasive,
-                out_cell_type_expr,
-                fv_cell_type_expr,
-                out_cell_type_gt_expr,
-                fv_cell_type_gt_expr,
-                batch_expr_pc,
-                comp_estimated,
-                _,
-                _,
-            ) = model(
-                batch_he_img,
-                batch_nuclei,
-                batch_n_cells,
-                expr_ref_batch,
-                batch_ct,
-                batch_expr_for_model,
-                patch_ids=patch_ids,
-                **model_extra_kwargs,
-            )
-            batch_expr_mask_pc = flatten_expr_mask(batch_expr_mask, batch_n_cells)
-
-            if batch_ct_pc.shape[0] == 0:
-                continue
-
-            if log_debug_once:
-                # Keep one debug line without any per-cell Pearson metrics (too noisy for logs).
-                aux = getattr(model, "last_aux_losses", {}) if hasattr(model, "last_aux_losses") else {}
-                ref_base = aux.get("expr_ref_base")
-                ref_gate = aux.get("expr_ref_gate")
-                ref_stats = ""
-                if ref_base is not None and isinstance(ref_base, torch.Tensor) and ref_base.numel() > 0:
-                    ref_stats = (
-                        " | ref_mean=%.4f ref_std=%.4f ref_min=%.4f ref_max=%.4f"
-                        % (
-                            ref_base.mean().item(),
-                            ref_base.std(unbiased=False).item(),
-                            ref_base.min().item(),
-                            ref_base.max().item(),
-                        )
-                    )
-                gate_stats = ""
-                if ref_gate is not None and isinstance(ref_gate, torch.Tensor) and ref_gate.numel() > 0:
-                    gate_stats = " | expr_ref_gate=%.4f" % ref_gate.detach().float().mean().item()
-                zero_frac = (
-                    (out_expr <= 0).float().mean().item() if out_expr.numel() > 0 else 0.0
-                )
-                logging.info(
-                    "Validation diagnostics: zero_frac=%.4f%s%s",
-                    zero_frac,
-                    ref_stats,
-                    gate_stats,
-                )
-                log_debug_once = False
-
-            # Use the raw (unmodified) GT expression for metrics.
-            expr_true_pc = flatten_expr(batch_expr, batch_n_cells)
-            if expr_true_pc is None or expr_true_pc.shape != out_expr.shape:
-                expr_true_pc = batch_expr_pc
-
-            pred = out_expr.detach().cpu().numpy()
-            target = expr_true_pc.detach().cpu().numpy()
-            mask_np = (
-                batch_expr_mask_pc.detach().cpu().numpy()
-                if batch_expr_mask_pc is not None
-                else None
-            )
-
-            # Panel completion prediction (gene-conditioned imputation head), if present.
-            pred_holdout = pred
-            completion_head = getattr(model, "completion_head", None)
-            if completion_head is not None and batch_expr_mask_pc is not None:
-                try:
-                    aux = getattr(model, "last_aux_losses", {}) if hasattr(model, "last_aux_losses") else {}
-                    ref_base = aux.get("expr_ref_base")
-                    ref_base_pc = (
-                        ref_base
-                        if ref_base is not None and isinstance(ref_base, torch.Tensor) and ref_base.shape == out_expr.shape
-                        else torch.zeros_like(out_expr)
-                    )
-                    mask_obs_f = (batch_expr_mask_pc > 0.5).float()
-                    delta_obs = (expr_true_pc - ref_base_pc) * mask_obs_f
-                    delta_morph = out_expr - ref_base_pc
-                    delta_hat = completion_head(delta_obs, mask_obs_f, delta_morph)
-                    pred_completed = F.relu(ref_base_pc + delta_hat)
-                    # At inference we keep measured genes as-is; this doesn't affect holdout metrics.
-                    pred_completed = mask_obs_f * expr_true_pc + (1.0 - mask_obs_f) * pred_completed
-                    pred_holdout = pred_completed.detach().cpu().numpy()
-                except Exception as exc:
-                    logging.warning("Panel completion head failed in validation (using morph-only preds): %s", exc)
-                    pred_holdout = pred
-
-            # Holdout-only metrics (imputation): evaluate on held-out genes only
-            hold_mask_vec = None
-            if holdout_mask_by_slide is not None:
-                hold_mask_vec = holdout_mask_by_slide.get(slide_id_val)
-            if hold_mask_vec is not None:
-                hold_mask_vec = np.asarray(hold_mask_vec, dtype=np.float64)
-                if hold_mask_vec.ndim == 1 and hold_mask_vec.size == pred.shape[1] and hold_mask_vec.sum() > 0:
-                    mask_hold = np.broadcast_to(hold_mask_vec, pred_holdout.shape)
-                    diff = pred_holdout - target
-                    holdout_sse += float(((diff ** 2) * mask_hold).sum())
-                    holdout_sae += float((np.abs(diff) * mask_hold).sum())
-                    holdout_n += float(mask_hold.sum())
-
-                    if compute_per_gene:
-                        stats_h = _get_holdout_gene_stats(slide_id_val)
-                        c = mask_hold.sum(axis=0)
-                        if np.any(c > 0):
-                            stats_h["count"] += c
-                            stats_h["sum_pred"] += (pred_holdout * mask_hold).sum(axis=0)
-                            stats_h["sum_targ"] += (target * mask_hold).sum(axis=0)
-                            stats_h["sum_pred2"] += ((pred_holdout**2) * mask_hold).sum(axis=0)
-                            stats_h["sum_targ2"] += ((target**2) * mask_hold).sum(axis=0)
-                            stats_h["sum_xy"] += ((pred_holdout * target) * mask_hold).sum(axis=0)
-
-            if compute_per_gene:
-                mask_gene = mask_np if mask_np is not None else np.ones_like(pred, dtype=np.float64)
-                stats = _get_per_gene_stats(slide_id_val)
-                c = mask_gene.sum(axis=0)
-                if np.any(c > 0):
-                    stats["count"] += c
-                    stats["sum_pred"] += (pred * mask_gene).sum(axis=0)
-                    stats["sum_targ"] += (target * mask_gene).sum(axis=0)
-                    stats["sum_pred2"] += ((pred**2) * mask_gene).sum(axis=0)
-                    stats["sum_targ2"] += ((target**2) * mask_gene).sum(axis=0)
-                    stats["sum_xy"] += ((pred * target) * mask_gene).sum(axis=0)
-
-            ct_np = batch_ct_pc.detach().cpu().numpy().astype(int)
-            if ct_np.size > 0:
-                ct_counts += np.bincount(ct_np, minlength=n_classes)
-                total_cells += ct_np.size
-
-                preds_np = (
-                    out_cell_type.detach().cpu().argmax(dim=1).numpy().astype(int)
-                )
-                pred_counts += np.bincount(preds_np, minlength=n_classes)
-                matches = preds_np == ct_np
-                if matches.any():
-                    correct_counts += np.bincount(
-                        ct_np[matches], minlength=n_classes
-                    )
-                # per-slide tallies
-                if slide_id_val not in ct_counts_per:
-                    ct_counts_per[slide_id_val] = np.zeros(n_classes, dtype=np.int64)
-                    pred_counts_per[slide_id_val] = np.zeros(n_classes, dtype=np.int64)
-                    correct_counts_per[slide_id_val] = np.zeros(n_classes, dtype=np.int64)
-                ct_counts_per[slide_id_val] += np.bincount(ct_np, minlength=n_classes)
-                pred_counts_per[slide_id_val] += np.bincount(preds_np, minlength=n_classes)
-                if matches.any():
-                    correct_counts_per[slide_id_val] += np.bincount(
-                        ct_np[matches], minlength=n_classes
-                    )
-
-    def _pooled_gene_corr_metrics(stats_by_slide):
-        if not stats_by_slide:
-            return {
-                "mean": 0.0,
-                "median": 0.0,
-                "max": 0.0,
-                "p95": 0.0,
-                "n_genes": 0,
-            }
-        stats_iter = list(stats_by_slide.values())
-        count = np.sum([s["count"] for s in stats_iter], axis=0)
-        sum_pred = np.sum([s["sum_pred"] for s in stats_iter], axis=0)
-        sum_targ = np.sum([s["sum_targ"] for s in stats_iter], axis=0)
-        sum_pred2 = np.sum([s["sum_pred2"] for s in stats_iter], axis=0)
-        sum_targ2 = np.sum([s["sum_targ2"] for s in stats_iter], axis=0)
-        sum_xy = np.sum([s["sum_xy"] for s in stats_iter], axis=0)
-        denom_x = sum_pred2 - (sum_pred ** 2) / np.maximum(count, 1e-8)
-        denom_y = sum_targ2 - (sum_targ ** 2) / np.maximum(count, 1e-8)
-        num = sum_xy - (sum_pred * sum_targ) / np.maximum(count, 1e-8)
-        denom = np.sqrt(np.maximum(denom_x, 0.0) * np.maximum(denom_y, 0.0))
-        corr = np.full_like(num, np.nan, dtype=np.float64)
-        valid = count > 1
-        corr[valid] = num[valid] / np.maximum(denom[valid], 1e-8)
-        corr_vals = corr[np.isfinite(corr)]
-        if corr_vals.size == 0:
-            return {
-                "mean": 0.0,
-                "median": 0.0,
-                "max": 0.0,
-                "p95": 0.0,
-                "n_genes": 0,
-            }
-        return {
-            "mean": float(np.mean(corr_vals)),
-            "median": float(np.median(corr_vals)),
-            "max": float(np.max(corr_vals)),
-            "p95": float(np.percentile(corr_vals, 95)),
-            "n_genes": int(corr_vals.size),
-        }
-
-    metrics = {}
-    if holdout_n > 0:
-        metrics["holdout_mse"] = float(holdout_sse / holdout_n)
-        metrics["holdout_mae"] = float(holdout_sae / holdout_n)
-    else:
-        metrics["holdout_mse"] = 0.0
-        metrics["holdout_mae"] = 0.0
-
-    if compute_per_gene and holdout_gene_stats:
-        corrs_all = []
-        corrs_per_slide = {}
-        holdout_per_gene = {}
-        holdout_per_gene_files = {}
-        for sid, stats in holdout_gene_stats.items():
-            c = stats["count"]
-            denom_x = stats["sum_pred2"] - (stats["sum_pred"] ** 2) / np.maximum(c, 1e-8)
-            denom_y = stats["sum_targ2"] - (stats["sum_targ"] ** 2) / np.maximum(c, 1e-8)
-            num = stats["sum_xy"] - (stats["sum_pred"] * stats["sum_targ"]) / np.maximum(c, 1e-8)
-            denom = np.sqrt(np.maximum(denom_x, 0.0) * np.maximum(denom_y, 0.0))
-            corr = np.full_like(num, np.nan, dtype=np.float64)
-            valid = c > 1
-            corr[valid] = num[valid] / np.maximum(denom[valid], 1e-8)
-            # only genes that were actually held out in this slide have c>0
-            corr_vals = corr[np.isfinite(corr)]
-            if corr_vals.size > 0:
-                corrs_per_slide[int(sid)] = float(np.nanmean(corr_vals))
-                corrs_all.extend(corr_vals.tolist())
-            else:
-                corrs_per_slide[int(sid)] = float("nan")
-
-            # Per-gene holdout Pearson (only held-out genes for this slide)
-            hold_mask_vec = None
-            if holdout_mask_by_slide is not None:
-                hold_mask_vec = holdout_mask_by_slide.get(int(sid))
-            if hold_mask_vec is not None:
-                hold_mask_vec = np.asarray(hold_mask_vec, dtype=np.float64)
-                hold_idx = np.where(hold_mask_vec > 0.0)[0]
-            else:
-                hold_idx = np.where(c > 0)[0]
-
-            if hold_idx.size > 0:
-                # keep deterministic ordering
-                hold_idx = np.sort(hold_idx)
-                holdout_per_gene[int(sid)] = {
-                    str(gene_names[i]): (float(corr[i]) if np.isfinite(corr[i]) else float("nan"))
-                    for i in hold_idx
-                }
-                if per_gene_dir and epoch is not None:
-                    os.makedirs(per_gene_dir, exist_ok=True)
-                    fp = os.path.join(
-                        per_gene_dir,
-                        f"slide{sid}_epoch{epoch}_holdout_per_gene_pearson.csv",
-                    )
-                    df_corr_h = pd.DataFrame(
-                        {
-                            "gene": [gene_names[i] for i in hold_idx],
-                            "pearson": corr[hold_idx],
-                            "n_cells": c[hold_idx],
-                        }
-                    )
-                    df_corr_h.to_csv(fp, index=False)
-                    holdout_per_gene_files[int(sid)] = fp
-                    logging.info(
-                        "Saved holdout per-gene Pearson for slide %s (epoch %s) to %s",
-                        sid,
-                        epoch,
-                        fp,
-                    )
-        metrics["holdout_gene_pearson_mean"] = float(np.nanmean(corrs_all)) if corrs_all else 0.0
-        metrics["holdout_gene_pearson_per_slide_mean"] = corrs_per_slide
-        holdout_pooled = _pooled_gene_corr_metrics(holdout_gene_stats)
-        metrics["holdout_gene_pooled_mean"] = holdout_pooled["mean"]
-        metrics["holdout_gene_pooled_median"] = holdout_pooled["median"]
-        metrics["holdout_gene_pooled_max"] = holdout_pooled["max"]
-        metrics["holdout_gene_pooled_p95"] = holdout_pooled["p95"]
-        metrics["holdout_gene_pooled_n_genes"] = holdout_pooled["n_genes"]
-        if holdout_per_gene:
-            metrics["holdout_pearson_per_gene"] = holdout_per_gene
-        if holdout_per_gene_files:
-            metrics["holdout_pearson_per_gene_files"] = holdout_per_gene_files
-
-    per_gene_files = {}
-    gene_pcc_distribution_per_slide = {}
-    if compute_per_gene and per_gene_stats:
-        if per_gene_dir:
-            os.makedirs(per_gene_dir, exist_ok=True)
-        per_gene_summary = {}
-        for sid, stats in per_gene_stats.items():
-            c = stats["count"]
-            denom_x = stats["sum_pred2"] - (stats["sum_pred"] ** 2) / np.maximum(c, 1e-8)
-            denom_y = stats["sum_targ2"] - (stats["sum_targ"] ** 2) / np.maximum(c, 1e-8)
-            num = stats["sum_xy"] - (stats["sum_pred"] * stats["sum_targ"]) / np.maximum(c, 1e-8)
-            denom = np.sqrt(np.maximum(denom_x, 0.0) * np.maximum(denom_y, 0.0))
-            corr = np.zeros_like(num)
-            valid = c > 1
-            corr[valid] = num[valid] / np.maximum(denom[valid], 1e-8)
-            corr[~valid] = np.nan
-
-            corr_vals = corr[np.isfinite(corr)]
-            if corr_vals.size > 0:
-                per_gene_summary[int(sid)] = {
-                    "mean": float(np.mean(corr_vals)),
-                    "median": float(np.median(corr_vals)),
-                    "max": float(np.max(corr_vals)),
-                    "p95": float(np.percentile(corr_vals, 95)),
-                    "n_genes": int(corr_vals.size),
-                }
-            else:
-                per_gene_summary[int(sid)] = {
-                    "mean": float("nan"),
-                    "median": float("nan"),
-                    "max": float("nan"),
-                    "p95": float("nan"),
-                    "n_genes": 0,
-                }
-
-            # Per-slide gene-PCC distribution summaries:
-            # all genes + top-k SVG subsets ranked by fixed Giotto scores.
-            dist_entry = {"all": _summarize_gene_pcc_distribution(corr)}
-            rank_order = svg_rank_gene_indices_by_slide.get(int(sid))
-            if rank_order is not None:
-                rank_order = np.asarray(rank_order, dtype=np.int64).reshape(-1)
-            for k_svg in svg_topk:
-                key = f"svg{k_svg}"
-                if rank_order is None or rank_order.size == 0:
-                    dist_entry[key] = _summarize_gene_pcc_distribution(np.array([], dtype=np.float64))
-                    continue
-                idx_top = rank_order[: min(int(k_svg), int(rank_order.size))]
-                idx_top = idx_top[(idx_top >= 0) & (idx_top < corr.shape[0])]
-                if idx_top.size == 0:
-                    dist_entry[key] = _summarize_gene_pcc_distribution(np.array([], dtype=np.float64))
-                else:
-                    dist_entry[key] = _summarize_gene_pcc_distribution(corr[idx_top])
-            gene_pcc_distribution_per_slide[int(sid)] = dist_entry
-
-            if per_gene_dir and epoch is not None:
-                fp = os.path.join(
-                    per_gene_dir, f"slide{sid}_epoch{epoch}_per_gene_pearson.csv"
-                )
-                df_corr = pd.DataFrame(
-                    {"gene": gene_names, "pearson": corr, "n_cells": c}
-                )
-                df_corr.to_csv(fp, index=False)
-                per_gene_files[int(sid)] = fp
-                logging.info(
-                    "Saved per-gene Pearson for slide %s (epoch %s) to %s",
-                    sid,
-                    epoch,
-                    fp,
-                )
-        if per_gene_files:
-            metrics["pearson_per_gene_files"] = per_gene_files
-        if per_gene_summary:
-            metrics["pearson_per_gene_summary_per_slide"] = per_gene_summary
-        if gene_pcc_distribution_per_slide:
-            metrics["gene_pcc_distribution_per_slide"] = gene_pcc_distribution_per_slide
-        pooled_gene = _pooled_gene_corr_metrics(per_gene_stats)
-        metrics["pearson_gene_pooled_mean"] = pooled_gene["mean"]
-        metrics["pearson_gene_pooled_median"] = pooled_gene["median"]
-        metrics["pearson_gene_pooled_max"] = pooled_gene["max"]
-        metrics["pearson_gene_pooled_p95"] = pooled_gene["p95"]
-        metrics["pearson_gene_pooled_n_genes"] = pooled_gene["n_genes"]
-
-    if total_cells > 0:
-        metrics["ct_prop_gt"] = (ct_counts / total_cells).tolist()
-        metrics["ct_prop_pred"] = (pred_counts / total_cells).tolist()
-        with np.errstate(divide="ignore", invalid="ignore"):
-            acc_per_class = np.divide(
-                correct_counts,
-                np.maximum(ct_counts, 1),
-            )
-        metrics["ct_accuracy_per_class"] = acc_per_class.tolist()
-        supported = ct_counts > 0
-        metrics["ct_accuracy_micro"] = float(correct_counts.sum() / total_cells)
-        metrics["ct_accuracy_macro"] = (
-            float(np.mean(acc_per_class[supported])) if supported.any() else 0.0
-        )
-    else:
-        zero_list = [0.0 for _ in range(n_classes)]
-        metrics["ct_prop_gt"] = zero_list
-        metrics["ct_prop_pred"] = zero_list
-        metrics["ct_accuracy_per_class"] = zero_list
-        metrics["ct_accuracy_micro"] = 0.0
-        metrics["ct_accuracy_macro"] = 0.0
-    # per-slide CT metrics
-    ct_per_slide = {}
-    for sid, counts in ct_counts_per.items():
-        preds = pred_counts_per.get(sid, np.zeros_like(counts))
-        correct = correct_counts_per.get(sid, np.zeros_like(counts))
-        total = counts.sum()
-        with np.errstate(divide="ignore", invalid="ignore"):
-            acc_per_class_slide = np.divide(correct, np.maximum(counts, 1))
-        supported = counts > 0
-        ct_per_slide[int(sid)] = {
-            "prop_gt": ((counts / max(total, 1)).tolist() if total > 0 else [0.0 for _ in range(n_classes)]),
-            "prop_pred": ((preds / max(preds.sum(), 1)).tolist() if preds.sum() > 0 else [0.0 for _ in range(n_classes)]),
-            "acc_per_class": acc_per_class_slide.tolist(),
-            "acc_micro": float(correct.sum() / max(total, 1)),
-            "acc_macro": float(np.mean(acc_per_class_slide[supported])) if supported.any() else 0.0,
-        }
-    metrics["ct_per_slide"] = ct_per_slide
-
-    model.train()
-    return metrics
-
-
+    logging.info(
+        "[punch] Selected slide=%s center=%s window_px=%.1f -> %s",
+        slide_idx,
+        meta["punch_center"],
+        window_px,
+        cache_path,
+    )
 
 
 def main(config):
-    opts = _to_namespace(json_file_to_pyobj(config.config_file))
+    opts = _to_namespace(utils.json_file_to_pyobj(config.config_file))
     torch.autograd.set_detect_anomaly(False)
 
     logging.basicConfig(
@@ -2383,7 +494,7 @@ def main(config):
         level=logging.INFO,
         stream=sys.stdout,
     )
-    device = get_device(config.gpu_id)
+    device = utils.get_device(config.gpu_id)
 
     eval_cfg = _to_namespace(getattr(opts, "evaluation", None)) or SimpleNamespace()
     if hasattr(opts, "data") and opts.data is not None:
@@ -2408,7 +519,6 @@ def main(config):
 
     # Leak guards are unconditional: fit statistics on train/val only and never
     # use GT cell types in reference weighting during validation/test-style paths.
-    trainval_only_stats = True
     opts.model.use_gt_ct_ref_weights = False
     opts.model.ecrm.use_gt_ct = False
     if not getattr(opts.model, "refiner_type", None):
@@ -2485,7 +595,7 @@ def main(config):
     else:
         make_new = True
 
-    timestamp = get_experiment_id(make_new, opts.experiment_dirs.load_dir, config.fold_id)
+    timestamp = utils.get_experiment_id(make_new, opts.experiment_dirs.load_dir, config.fold_id)
     timestamp_override = os.environ.get("RUN_ID")
     if timestamp_override:
         if os.path.isabs(timestamp_override):
@@ -2575,8 +685,8 @@ def main(config):
             for idx, name in enumerate(classes)
             if str(name).strip().lower() in immune_label_whitelist
         ]
-        print(classes)
-        print(f"Num cell types {n_classes}")
+        logging.info("Cell types: %s", classes)
+        logging.info("Num cell types: %d", n_classes)
     else:
         n_classes = 0
         classes = []
@@ -2586,7 +696,12 @@ def main(config):
     def _ensure_list(sources):
         if not isinstance(sources, (list, tuple)):
             sources = [sources]
-        return [_to_namespace(json_file_to_pyobj(src)) if isinstance(src, str) else _to_namespace(src) for src in sources]
+        return [
+            _to_namespace(utils.json_file_to_pyobj(src))
+            if isinstance(src, str)
+            else _to_namespace(src)
+            for src in sources
+        ]
 
     sources_trainval = _ensure_list(getattr(opts, "data_sources_train_val", []))
     sources_test = _ensure_list(getattr(opts, "data_sources_test", []))
@@ -2800,7 +915,7 @@ def main(config):
                         if sample_cap < cell_ids_all.size
                         else cell_ids_all
                     )
-                    kept_ids, coords_yx = _centroids_from_label_image(
+                    kept_ids, coords_yx = spatial_utils.centroids_from_label_image(
                         fp_microns, sample_ids, chunk_rows=256
                     )
                     if kept_ids.size < 100:
@@ -2812,7 +927,7 @@ def main(config):
                     expr_model = np.log1p(np.clip(expr_counts, 0.0, None)) * float(
                         opts.data.expr_scale
                     )
-                    return _morans_many(expr_model, coords_yx, k=8)
+                    return metric_utils.morans_many(expr_model, coords_yx, k=8)
                 except Exception as exc:
                     logging.warning(
                         "SVG Moran ranking failed for slide %s: %s",
@@ -2947,7 +1062,7 @@ def main(config):
     # Build avgexp priors in target scale (expr_scale * log1p(counts)).
     avgexp_df_by_slide = {}
     if use_avgexp and use_celltype and classes:
-        avgexp_df_by_slide = build_avgexp_df_by_slide(
+        avgexp_df_by_slide = reference_utils.build_avgexp_df_by_slide(
             all_sources,
             stats_sources,
             gene_names,
@@ -3121,7 +1236,7 @@ def main(config):
         sid = int(getattr(src, "slide_idx", -1))
         if sid in slide_coord_map_by_slide:
             continue
-        cmap = _load_histology_coord_map_from_source(src)
+        cmap = spatial_utils.load_histology_coord_map_from_source(src)
         if cmap:
             slide_coord_map_by_slide[sid] = cmap
     logging.info(
@@ -3173,7 +1288,7 @@ def main(config):
         expr_ref_torch = None
 
     n_genes = len(gene_names)
-    print(f"{n_genes} genes (union)")
+    logging.info("%d genes (union)", n_genes)
 
     fp_out = os.path.join(experiment_path, "genes.txt")
     with open(fp_out, "w") as f:
@@ -3189,9 +1304,9 @@ def main(config):
         except Exception:
             pass
 
-    framework_name = f"{Framework.__module__}.{Framework.__name__}"
+    framework_name = f"{model_framework.Framework.__module__}.{model_framework.Framework.__name__}"
     try:
-        model = Framework(
+        model = model_framework.Framework(
             n_classes,
             n_genes,
             opts.model.emb_dim,
@@ -3204,7 +1319,7 @@ def main(config):
         )
         logging.info("Using %s (with model_cfg)", framework_name)
     except TypeError:
-        model = Framework(
+        model = model_framework.Framework(
             n_classes,
             n_genes,
             opts.model.emb_dim,
@@ -3217,7 +1332,7 @@ def main(config):
         logging.info("Using %s (no model_cfg)", framework_name)
 
     if panel_completion_enabled:
-        model.completion_head = PanelCompletionHead(
+        model.completion_head = panel_completion.PanelCompletionHead(
             n_genes,
             hidden_dim=panel_hidden_dim,
             dropout=panel_dropout,
@@ -3287,7 +1402,7 @@ def main(config):
             df_ref = avgexp_df_by_slide.get(slide_id)
             if df_ref is not None:
                 fallback_val_df_by_slide[slide_id] = df_ref
-        avgexp_val_df_by_slide = _build_train_region_avgexp_df_by_slide(
+        avgexp_val_df_by_slide = reference_utils.build_train_region_avgexp_df_by_slide(
             sources_trainval,
             train_regions,
             config.fold_id,
@@ -3318,7 +1433,9 @@ def main(config):
                 expr_ref_torch_val = expr_ref_torch
                 expr_ref_torch_val_map = expr_ref_torch_map
             elif ref_stack_val:
-                expr_ref_torch_val = torch.from_numpy(np.nanmean(np.stack(ref_stack_val, axis=0), axis=0)).float().to(device)
+                expr_ref_torch_val = torch.from_numpy(
+                    np.nanmean(np.stack(ref_stack_val, axis=0), axis=0)
+                ).float().to(device)
                 logging.info(
                     "Validation avgexp refs use train-region-only statistics for %d train slide(s).",
                     len(ref_stack_val),
@@ -3327,51 +1444,6 @@ def main(config):
             logging.warning(
                 "Validation train-region avgexp refs could not be built; using standard refs.",
             )
-
-    def _slide_batch_sampler(datasets, batch_size, interleave=False):
-        sampler_seed = int(getattr(opts.training, "batch_sampler_seed", 0))
-        shuffle_within_slide = bool(
-            getattr(opts.training, "shuffle_within_slide_batches", True)
-        )
-        weighted_interleave = bool(
-            getattr(opts.training, "weighted_interleave_slide_batches", True)
-        )
-        weight_cap = float(getattr(opts.training, "sampler_weight_cap", 3.0))
-        offsets = []
-        lengths = []
-        acc = 0
-        for ds in datasets:
-            offsets.append(acc)
-            l = len(ds)
-            lengths.append(l)
-            acc += l
-        if interleave:
-            logging.info(
-                "Using interleaved slide batch sampler: seed=%d shuffle_within_slide=%s weighted=%s",
-                sampler_seed,
-                str(shuffle_within_slide),
-                str(weighted_interleave),
-            )
-            slide_weights = None
-            if weighted_interleave:
-                slide_weights = []
-                for ds in datasets:
-                    slide_weights.append(getattr(ds, "patch_weights", None))
-            return _InterleavedSlideBatchSampler(
-                datasets,
-                batch_size,
-                seed=sampler_seed,
-                shuffle_within_slide=shuffle_within_slide,
-                shuffle_slide_order=True,
-                slide_weights=slide_weights,
-                weight_cap=weight_cap,
-            )
-        batches = []
-        for off, l in zip(offsets, lengths):
-            idxs = list(range(off, off + l))
-            for i in range(0, l, batch_size):
-                batches.append(idxs[i : i + batch_size])
-        return batches
 
     immune_sampler_boost = float(getattr(opts.training, "immune_sampler_boost", 1.0))
     # Derive a boost automatically if none provided (>1 only when immune classes are rare)
@@ -3408,7 +1480,7 @@ def main(config):
     train_datasets = []
     for src in train_sources:
         src_ns = src if isinstance(src, SimpleNamespace) else SimpleNamespace(**src)
-        ds = DataProcessing(
+        ds = dataset_input_tma.DataProcessingUnion(
             src_ns,
             opts.data,
             train_regions,
@@ -3482,9 +1554,10 @@ def main(config):
         batches = None
     else:
         train_dataset = torch.utils.data.ConcatDataset(train_datasets)
-        batches = _slide_batch_sampler(
+        batches = sampler_utils.slide_batch_sampler(
             train_datasets,
             opts.training.batch_size,
+            opts.training,
             interleave=bool(getattr(opts.training, "interleave_slide_batches", True)),
         )
         use_batch_sampler = True
@@ -3619,7 +1692,7 @@ def main(config):
         datasets = []
         for src in src_list:
             src_ns = src if isinstance(src, SimpleNamespace) else SimpleNamespace(**src)
-            ds = DataProcessing(
+            ds = dataset_input_tma.DataProcessingUnion(
                 src_ns,
                 opts.data,
                 regions,
@@ -3653,9 +1726,10 @@ def main(config):
             kwargs = {
                 "dataset": dataset,
                 "num_workers": opts.data.num_workers,
-                "batch_sampler": _slide_batch_sampler(
+                "batch_sampler": sampler_utils.slide_batch_sampler(
                     datasets,
                     opts.training.batch_size,
+                    opts.training,
                     interleave=False,
                 ),
                 "drop_last": False,
@@ -3684,7 +1758,7 @@ def main(config):
     svg_topk = (20, 50)
     svg_knn_k = 8
     svg_sample_cap = 3000
-    val_svg_rank_indices_by_slide = _compute_svg_rank_gene_indices_by_slide(
+    val_svg_rank_indices_by_slide = spatial_utils.compute_svg_rank_gene_indices_by_slide(
         sources_trainval,
         opts.regions_val,
         config.fold_id,
@@ -3693,7 +1767,7 @@ def main(config):
         k_neighbors=svg_knn_k,
         sample_cap=svg_sample_cap,
     )
-    ext_svg_rank_indices_by_slide = _compute_svg_rank_gene_indices_by_slide(
+    ext_svg_rank_indices_by_slide = spatial_utils.compute_svg_rank_gene_indices_by_slide(
         sources_test,
         ext_regions,
         config.fold_id,
@@ -3745,7 +1819,7 @@ def main(config):
             logging.warning("Strict state_dict load failed (%s); retrying with strict=False", exc)
             model.load_state_dict(checkpoint["model_state_dict"], strict=False)
         epoch = checkpoint["epoch"]
-        print("Loaded " + load_path)
+        logging.info("Loaded %s", load_path)
 
         model.to(device)
 
@@ -3758,9 +1832,9 @@ def main(config):
             )
             checkpoint = torch.load(load_path)
             optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-            print("Loaded " + load_path)
+            logging.info("Loaded %s", load_path)
         except:
-            print("Optimizer state dict not found")
+            logging.warning("Optimizer state dict not found")
 
     else:
         model.to(device)
@@ -3781,12 +1855,7 @@ def main(config):
         weight=class_weights_torch, reduction="mean"
     )
     loss_expr_ct_embed = nn.CosineEmbeddingLoss(reduction="mean")
-    loss_expr = nn.MSELoss(reduction="mean")
-    loss_expr_immune = nn.MSELoss(reduction="mean")
-    loss_expr_invasive = nn.MSELoss(reduction="mean")
     loss_logits = nn.MSELoss(reduction="mean")
-    loss_comp_est = nn.KLDivLoss(reduction="batchmean")
-    loss_comp_gt = nn.KLDivLoss(reduction="batchmean")
 
     zero_weight = float(getattr(opts.training, "zero_weight", 0.1))
     zero_threshold = float(getattr(opts.training, "zero_threshold", 0.0))
@@ -3800,7 +1869,9 @@ def main(config):
     logits_loss_weight = float(getattr(opts.training, "logits_loss_weight", 1.0))
     bulk_loss_weight = float(getattr(opts.training, "bulk_loss_weight", 0.0))
     logging.info(
-        "Loss setup: corr=%.3f pearson=%.3f expr_ct_embed_w=%.3f logits_w=%.3f bulk=%.3f expr_ct_embed_internal=100 interleave_slide_batches=%s",
+        "Loss setup: corr=%.3f pearson=%.3f expr_ct_embed_w=%.3f "
+        "logits_w=%.3f bulk=%.3f expr_ct_embed_internal=100 "
+        "interleave_slide_batches=%s",
         corr_loss_weight,
         pearson_loss_weight,
         expr_ct_embed_loss_weight,
@@ -3828,7 +1899,7 @@ def main(config):
         mse_den = w.sum().clamp_min(1e-8)
         loss_mse_val = mse_num / mse_den
 
-        loss_corr_val = masked_pearson(pred, target, mask)
+        loss_corr_val = metric_utils.masked_pearson(pred, target, mask)
         return loss_mse_val + corr_loss_weight * loss_corr_val
 
     def masked_mse(pred, target, mask):
@@ -3892,37 +1963,6 @@ def main(config):
         vals = x[m]
         return torch.var(vals, unbiased=False)
 
-    def masked_pearson(pred, target, mask, eps=1e-6):
-        if mask is None:
-            return pearson_loss(pred, target, eps=eps)
-        mask = mask.float()
-        valid = mask.sum(dim=1, keepdim=True).clamp_min(1.0)
-        pred_center = (pred * mask - (pred * mask).sum(dim=1, keepdim=True) / valid)
-        targ_center = (target * mask - (target * mask).sum(dim=1, keepdim=True) / valid)
-        num = (pred_center * targ_center * mask).sum(dim=1)
-        denom = (
-            ((pred_center**2) * mask).sum(dim=1).clamp_min(eps).sqrt()
-            * ((targ_center**2) * mask).sum(dim=1).clamp_min(eps).sqrt()
-        ).clamp_min(eps)
-        corr = num / denom
-        return (1.0 - corr).mean()
-
-    # losses_names = [
-    #     "loss_epoch_expr",
-    #     "loss_epoch_ct_hist",
-    #     "loss_epoch_map",
-    #     "loss_epoch_expr_ct",
-    #     "loss_epoch_expr_immune",
-    #     "loss_epoch_expr_invasive",
-    #     "loss_epoch_expr_ct_embed",
-    #     "loss_epoch_logits",
-    #     "loss_epoch_comp_est",
-    #     "loss_epoch_comp_gt"
-    # ]
-    # df_losses = pd.DataFrame(
-    #     0.0, index=list(range(opts.training.total_epochs)), columns=losses_names
-    # )
-
     total_epochs = opts.training.total_epochs
     ext_eval_every_epochs = max(1, int(getattr(eval_cfg, "external_every_epochs", 5)))
     ext_eval_final_epoch = bool(getattr(eval_cfg, "external_final_epoch", True))
@@ -3945,7 +1985,7 @@ def main(config):
                 os.remove(fp)
 
     for epoch in range(initial_epoch, total_epochs):
-        print(f"Epoch: {epoch+1}")
+        logging.info("Epoch: %d", epoch + 1)
         # Encoder stays frozen for the entire run (no unfreeze step)
         model.train()
         if hasattr(model, "set_epoch_progress"):
@@ -4015,7 +2055,7 @@ def main(config):
             model_extra_kwargs = {}
             if supports_cell_graph:
                 coord_map_slide = slide_coord_map_by_slide.get(slide_id_val)
-                graph = build_cell_graph(
+                graph = graph_utils.build_cell_graph(
                     batch_nuclei,
                     patch_ids,
                     k_neighbors=graph_k,
@@ -4030,7 +2070,7 @@ def main(config):
                     "cell_patch_ids": graph.patch_index,
                 }
 
-            batch_expr_mask_pc = flatten_expr_mask(batch_expr_mask, batch_n_cells)
+            batch_expr_mask_pc = tensor_utils.flatten_expr_mask(batch_expr_mask, batch_n_cells)
 
             # Optional: random hiding mask for panel-completion training (defined in per-cell space).
             mask_panel_pc = (
@@ -4149,7 +2189,6 @@ def main(config):
             if batch_ct_pc.shape[0] == 0:
                 continue
 
-            current_immune_frac = 0.0
             if (
                 epoch_class_counts is not None
                 and immune_class_indices
@@ -4164,13 +2203,6 @@ def main(config):
                     .numpy()
                 )
                 epoch_class_counts += class_counts_batch
-                immune_count = class_counts_batch[immune_class_indices].sum()
-                total_cells_batch = class_counts_batch.sum()
-                if total_cells_batch > 0:
-                    current_immune_frac = float(immune_count) / float(
-                        total_cells_batch
-                    )
-                pass
 
             aux_main = getattr(model, "last_aux_losses", {}) or {}
             ref_base_main = aux_main.get("expr_ref_base")
@@ -4195,7 +2227,7 @@ def main(config):
                 and hasattr(model, "completion_head")
                 and model.completion_head is not None
             ):
-                expr_true_pc = flatten_expr(batch_expr, batch_n_cells)
+                expr_true_pc = tensor_utils.flatten_expr(batch_expr, batch_n_cells)
                 if expr_true_pc is not None and expr_true_pc.shape == out_expr.shape:
                     ref_base_pc = (
                         ref_base_main
@@ -4422,7 +2454,7 @@ def main(config):
             # in train.py; corr_loss_weight is intentionally kept off here.
             pearson_weight_mult = pearson_loss_weight
             if pearson_weight_mult > 0:
-                loss_pearson_val = masked_pearson(
+                loss_pearson_val = metric_utils.masked_pearson(
                     pred_expr_for_loss,
                     target_expr_for_loss,
                     batch_expr_mask_pc,
@@ -4535,10 +2567,11 @@ def main(config):
 
             optimizer.step()
 
-        print(
-            "Epoch[{}/{}], Loss:{:.4f}".format(
-                epoch + 1, opts.training.total_epochs, loss_epoch
-            )
+        logging.info(
+            "Epoch[%d/%d], Loss:%.4f",
+            epoch + 1,
+            opts.training.total_epochs,
+            loss_epoch,
         )
         if use_celltype:
             pred_dist_epoch = running_pred_counts / running_pred_counts.sum().clamp_min(1.0)
@@ -4580,7 +2613,7 @@ def main(config):
 
         val_metrics = None
         if val_dataloader is not None:
-            val_metrics = evaluate_validation(
+            val_metrics = evaluation_utils.evaluate_validation(
                 model,
                 val_dataloader,
                 expr_ref_torch_val,
@@ -4598,7 +2631,7 @@ def main(config):
                 svg_rank_gene_indices_by_slide=val_svg_rank_indices_by_slide,
                 svg_topk=svg_topk,
             )
-            _log_gene_pcc_epoch(
+            metric_utils.log_gene_pcc_epoch(
                 val_metrics,
                 split_tag="VAL",
                 epoch=epoch + 1,
@@ -4612,7 +2645,7 @@ def main(config):
                 ext_eval_final_epoch and (epoch + 1 == total_epochs)
             )
         if run_ext_eval and external_dataloader is not None:
-            ext_metrics = evaluate_validation(
+            ext_metrics = evaluation_utils.evaluate_validation(
                 model,
                 external_dataloader,
                 expr_ref_torch,
@@ -4630,7 +2663,7 @@ def main(config):
                 svg_rank_gene_indices_by_slide=ext_svg_rank_indices_by_slide,
                 svg_topk=svg_topk,
             )
-            _log_gene_pcc_epoch(
+            metric_utils.log_gene_pcc_epoch(
                 ext_metrics,
                 split_tag="EXT",
                 epoch=epoch + 1,
