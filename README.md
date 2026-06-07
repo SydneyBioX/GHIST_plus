@@ -18,7 +18,9 @@ GHIST+ is a framework for tissue-wide reconstruction of single-cell molecular st
 
 ## Installation
 
-Use a CUDA-enabled machine with a compatible PyTorch install.
+Use a CUDA-enabled Linux machine with a compatible PyTorch install. The code was
+tested on Ubuntu 24.04.1 LTS, Python 3.10.16, NVIDIA RTX A6000 GPUs, driver
+550.120, and PyTorch 2.6.0 with CUDA 12.4.
 
 ```bash
 conda create --name model_env python=3.10
@@ -30,7 +32,14 @@ pip install tifffile imageio opencv-python pillow timm huggingface_hub torchstai
 pip install git+https://github.com/sebastianffx/stainlib.git
 ```
 
-The first run downloads the UNI2-h checkpoint through the Hugging Face cache.
+Tested package versions include `torch==2.6.0`, `torchvision==0.21.0`,
+`numpy==1.26.4`, `pandas==2.3.2`, `scipy==1.15.3`, `scikit-learn==1.7.1`,
+`matplotlib==3.8.2`, `timm==0.9.12`, `huggingface_hub==0.33.2`, and
+`torchstain==1.4.1`.
+
+Installation usually takes 10-30 minutes on a CUDA Linux workstation, excluding
+large downloads. The first run downloads the UNI2-h checkpoint through the
+Hugging Face cache.
 
 ## Example Notebook
 
@@ -54,6 +63,11 @@ The example runs BreastCancer2 fullslide prediction using the H&E image, nuclei
 segmentation, saved checkpoint, stripped cache, and train-derived average
 expression reference. BreastCancer2 expression and cell-type labels are not used
 during prediction.
+
+Expected outputs include predicted expression files, predicted cell-type files,
+cell-type probability files, and run metadata. Runtime depends on GPU and disk
+speed; on a CUDA workstation, the cached demo is expected to run in minutes to
+hours. CPU-only execution is not recommended.
 
 ## Data Configuration
 
@@ -113,3 +127,5 @@ Main outputs:
 - Large generated files are ignored by `.gitignore`.
 - Keep the config, checkpoint, `genes.txt`, stain standardisation file, and
   matching cache together when moving a trained run.
+- To reproduce manuscript-scale experiments, use the provided config format with
+  the corresponding datasets, checkpoints, and run paths.
