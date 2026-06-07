@@ -66,8 +66,7 @@ during prediction.
 
 Expected outputs include predicted expression files, predicted cell-type files,
 cell-type probability files, and run metadata. Runtime depends on GPU and disk
-speed; on a CUDA workstation, the cached demo is expected to run in minutes to
-hours. CPU-only execution is not recommended.
+speed; on a CUDA workstation, the cached demo is expected to run in within 5 minutes.
 
 ## Data Configuration
 
