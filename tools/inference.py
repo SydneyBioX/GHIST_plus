@@ -138,13 +138,17 @@ def _resolve_regions(opts, split_name: str):
 
 def _build_model(gba, opts, n_classes, n_genes, n_ref, use_avgexp, use_celltype, use_neighb, device):
     fm_cfg = getattr(opts.model, "foundation_model", None)
-    if fm_cfg is not None:
+    if fm_cfg is None:
+        fm_cfg = SimpleNamespace(pretrained=False)
+        opts.model.foundation_model = fm_cfg
+    else:
         try:
             setattr(fm_cfg, "pretrained", False)
         except Exception:
             pass
+    framework_cls = gba.model_framework.Framework
     try:
-        model = gba.Framework(
+        model = framework_cls(
             n_classes,
             n_genes,
             opts.model.emb_dim,
@@ -156,7 +160,7 @@ def _build_model(gba, opts, n_classes, n_genes, n_ref, use_avgexp, use_celltype,
             model_cfg=opts.model,
         )
     except TypeError:
-        model = gba.Framework(
+        model = framework_cls(
             n_classes,
             n_genes,
             opts.model.emb_dim,
@@ -168,8 +172,9 @@ def _build_model(gba, opts, n_classes, n_genes, n_ref, use_avgexp, use_celltype,
         )
     holdout_n_genes = int(getattr(getattr(opts, "training", None), "holdout_n_genes", 20))
     panel_completion_enabled = holdout_n_genes > 0
-    if panel_completion_enabled and hasattr(gba, "PanelCompletionHead"):
-        model.completion_head = gba.PanelCompletionHead(
+    completion_head_cls = getattr(gba.panel_completion, "PanelCompletionHead", None)
+    if panel_completion_enabled and completion_head_cls is not None:
+        model.completion_head = completion_head_cls(
             n_genes,
             hidden_dim=256,
             dropout=0.0,
@@ -379,7 +384,7 @@ def main():
         _log("[INFO] targets unavailable; export dataset will use mode=test")
 
     regions_eval = _resolve_regions(opts, "test" if eval_split == "test" else "val")
-    dataset = gba.DataProcessing(
+    dataset = gba.dataset_input.DataProcessingUnion(
         src_eval,
         opts.data,
         regions_eval,
@@ -409,7 +414,7 @@ def main():
     all_sources = train_sources + test_sources
     expr_ref_torch_map = {}
     if use_avgexp:
-        avgexp_df_by_slide = gba.build_avgexp_df_by_slide(
+        avgexp_df_by_slide = gba.reference_utils.build_avgexp_df_by_slide(
             all_sources,
             train_sources,
             gene_names,
@@ -529,12 +534,12 @@ def main():
         1,
     )
     slide_coord_map_by_slide = {}
-    if supports_cell_graph and hasattr(gba, "_load_histology_coord_map_from_source"):
+    if supports_cell_graph and hasattr(gba, "spatial_utils"):
         for src in all_sources:
             sid = int(getattr(src, "slide_idx", -1))
             if sid in slide_coord_map_by_slide:
                 continue
-            coord_map = gba._load_histology_coord_map_from_source(src)
+            coord_map = gba.spatial_utils.load_histology_coord_map_from_source(src)
             if coord_map:
                 slide_coord_map_by_slide[sid] = coord_map
         _log(f"[INFO] loaded cell-coordinate maps for {len(slide_coord_map_by_slide)} slide(s)")
@@ -577,7 +582,7 @@ def main():
                 coord_map_slide = None
                 if isinstance(slide_coord_map_by_slide, dict):
                     coord_map_slide = slide_coord_map_by_slide.get(slide_id_val)
-                graph = gba.build_cell_graph(
+                graph = gba.graph_utils.build_cell_graph(
                     batch_nuclei,
                     patch_ids,
                     k_neighbors=graph_k,
@@ -738,7 +743,7 @@ def main():
                 eval_epoch = None
         per_gene_dir = out_dir / "per_gene"
         _log("[INFO] computing metrics via train.evaluate_validation()")
-        metrics = gba.evaluate_validation(
+        metrics = gba.evaluation_utils.evaluate_validation(
             model,
             dataloader,
             expr_ref_torch,
