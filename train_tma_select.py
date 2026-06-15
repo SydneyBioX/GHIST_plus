@@ -87,6 +87,7 @@ def _as_float_attr(obj, names, default):
     return float(default)
 
 
+# TMA punch preselection
 def preselect_tma_punch_with_vq(
     model,
     src,
@@ -495,6 +496,7 @@ def main(config):
     )
     device = utils.get_device(config.gpu_id)
 
+    # Runtime configuration
     eval_cfg = _to_namespace(getattr(opts, "evaluation", None)) or SimpleNamespace()
     if hasattr(opts, "data") and opts.data is not None:
         if not hasattr(opts.data, "punch_select_enabled"):
@@ -536,6 +538,7 @@ def main(config):
         getattr(opts.model.ecrm, "residual_gate_init", -1.4)
     )
 
+    # Output and cache paths
     this_dir = os.path.abspath(os.path.dirname(__file__))
     nature_root = this_dir
     output_root_override = os.environ.get("OUTPUT_ROOT")
@@ -652,6 +655,7 @@ def main(config):
     }
     _write_json(os.path.join(metrics_dir, "run_meta.json"), run_meta)
 
+    # Model and source setup
     logging.info("Initialising model")
 
     use_avgexp = opts.comps.avgexp
@@ -707,6 +711,7 @@ def main(config):
         len(sources_test),
     )
 
+    # Gene panel and training statistics
     gene_union = set()
     expr_per_source = {}
     for src in all_sources:
@@ -724,6 +729,7 @@ def main(config):
         len(excluded_paths),
     )
 
+    # Holdout and panel-completion settings
     holdout_n_genes = int(getattr(opts.training, "holdout_n_genes", 20))
     holdout_seed = int(getattr(opts.training, "holdout_seed", 0))
     if holdout_n_genes < 0:
@@ -772,6 +778,7 @@ def main(config):
         panel_use_morph,
     )
 
+    # Expression baselines and imputation statistics
     gene_means = {}
     for g in gene_names:
         vals = []
@@ -1020,6 +1027,7 @@ def main(config):
             len(gene_names),
         )
 
+    # Imputation cache
     gene_union_hash = hashlib.md5(",".join(gene_names).encode("utf-8")).hexdigest()[:8]
     impute_dir = os.path.join(cache_root, f"imputed_{gene_union_hash}")
     os.makedirs(impute_dir, exist_ok=True)
@@ -1158,6 +1166,7 @@ def main(config):
     train_sources = imputed_trainval
     test_sources = imputed_test
 
+    # Spatial graph support
     slide_coord_map_by_slide = {}
     for src in (train_sources + test_sources):
         sid = int(getattr(src, "slide_idx", -1))
@@ -1176,6 +1185,7 @@ def main(config):
             "graph will fall back to within-patch connectivity."
         )
 
+    # Reference priors
     expr_ref_torch_map = {}
     if use_avgexp and imputed_refs:
         ref_counts = []
@@ -1272,6 +1282,7 @@ def main(config):
     logging.info("Cell-graph support: %s", supports_cell_graph)
     model.to(device)
 
+    # Datasets, TMA selection, and loaders
     logging.info("Preparing data")
 
     regions_train = getattr(opts, "regions_train", None)
@@ -1697,6 +1708,7 @@ def main(config):
         svg_sample_cap,
     )
 
+    # Optimizer, resume, and losses
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=opts.training.learning_rate,
@@ -1829,6 +1841,7 @@ def main(config):
             if os.path.isfile(fp):
                 os.remove(fp)
 
+    # Training loop
     for epoch in range(initial_epoch, total_epochs):
         logging.info("Epoch: %d", epoch + 1)
         model.train()
@@ -2393,6 +2406,7 @@ def main(config):
             )
             logging.info("Optimiser saved: %s" % save_path)
 
+        # Evaluation and checkpoint selection
         val_metrics = None
         if val_dataloader is not None:
             val_metrics = evaluation_utils.evaluate_validation(
@@ -2527,7 +2541,7 @@ def main(config):
                 best_val_ct_macro,
             )
 
-
+    # Best-checkpoint summary
     strict_best = {
         "selection_metric": "pearson_gene_pooled_mean",
         "selection_constraint": "non_decreasing_ct_accuracy_macro",

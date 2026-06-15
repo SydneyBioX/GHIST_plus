@@ -6,8 +6,8 @@ import os
 import numpy as np
 import pandas as pd
 
+import dataio.utils as image_utils
 import utils.metrics as metric_utils
-import utils.utils as utils
 
 
 def resolve_divisions_fold(opts_regions, fold_id: int):
@@ -40,7 +40,7 @@ def read_image_hw(fp_img: str):
             return int(shape[0]), int(shape[1])
     except Exception:
         pass
-    img = utils.load_image(fp_img)
+    img = image_utils.load_image(fp_img)
     return int(img.shape[0]), int(img.shape[1])
 
 
