@@ -8,20 +8,15 @@ import sys
 import os
 import json
 import hashlib
-import tifffile
 import natsort
-import h5py
 from pathlib import Path
 from tqdm import tqdm
 import torchvision
-import imageio
 import torchstain
-from torchvision import transforms
 import cv2
 
 torchvision.disable_beta_transforms_warning()
 from torchvision.transforms import v2
-import torch.nn.functional as F
 
 from .utils import load_image
 

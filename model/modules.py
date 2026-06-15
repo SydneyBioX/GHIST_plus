@@ -1,13 +1,11 @@
 """Reusable neural-network modules for GHIST+."""
 
 import math
-import random
 import time
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.nn.utils import spectral_norm as _spectral_norm
 from torch.amp import autocast as amp_autocast
 from torch.utils.checkpoint import checkpoint
 

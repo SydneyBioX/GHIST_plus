@@ -6,19 +6,8 @@ import json
 import collections
 import re
 import torch
-from scipy.special import softmax
 import numpy as np
-import random
-import matplotlib.pyplot as plt
 import natsort
-from torchvision.utils import save_image, make_grid
-from matplotlib.animation import FuncAnimation, PillowWriter
-import tifffile
-import scipy
-import pandas as pd
-import glob
-import h5py
-from sklearn.manifold import TSNE
 
 
 def get_device(gpu_id):
