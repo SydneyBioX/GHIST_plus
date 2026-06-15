@@ -48,12 +48,10 @@
         "wsize": 224,
         "overlap": 30,
         "max_cells_per_patch": 600,
-        "pin_memory": true,
-        "cache_mode": "disk"
+        "pin_memory": true
     },
     "model": {
         "emb_dim": 1024,
-        "external_head_ckpt": [],
         "avgexp_temp": 1.0,
         "avgexp_residual_scale": 1.0,
         "ct_prior_blend_alpha": 1.0,
@@ -178,8 +176,6 @@
     "experiment_dirs": {
         "load_dir": "${RUN_ROOT}/results",
         "metrics_dir": "${RUN_ROOT}/metrics",
-        "model_dir": "models",
-        "test_output_dir": "test_output",
-        "val_output_dir": "val_output"
+        "model_dir": "models"
     }
 }

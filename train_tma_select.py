@@ -9,7 +9,6 @@ import hashlib
 from types import SimpleNamespace
 import inspect
 import json
-import warnings
 
 import torch
 import torch.nn as nn
@@ -517,8 +516,6 @@ def main(config):
             "Config field 'strict_method' is deprecated and ignored; leak guards are always enabled."
         )
 
-    # Leak guards are unconditional: fit statistics on train/val only and never
-    # use GT cell types in reference weighting during validation/test-style paths.
     opts.model.use_gt_ct_ref_weights = False
     opts.model.ecrm.use_gt_ct = False
     if not getattr(opts.model, "refiner_type", None):
@@ -589,7 +586,6 @@ def main(config):
     )
     os.makedirs(cache_root, exist_ok=True)
 
-    # Create experiment directories
     if config.resume_epoch != 0:
         make_new = False
     else:
@@ -635,7 +631,6 @@ def main(config):
     os.makedirs(experiment_path + "/" + opts.experiment_dirs.model_dir, exist_ok=True)
     os.makedirs(per_gene_dir, exist_ok=True)
 
-    # Save copy of current config file
     shutil.copyfile(
         config.config_file, experiment_path + "/" + os.path.basename(config.config_file)
     )
@@ -657,7 +652,6 @@ def main(config):
     }
     _write_json(os.path.join(metrics_dir, "run_meta.json"), run_meta)
 
-    # Set up the model
     logging.info("Initialising model")
 
     use_avgexp = opts.comps.avgexp
@@ -692,7 +686,6 @@ def main(config):
         classes = []
         class_weights_np = None
 
-    # Build union gene list from all train/val (and test) sources and impute missing genes.
     def _ensure_list(sources):
         if not isinstance(sources, (list, tuple)):
             sources = [sources]
@@ -714,8 +707,6 @@ def main(config):
         len(sources_test),
     )
 
-    # Build the union panel from all known sources, but fit all statistics on
-    # train/val sources only to avoid leaking test expression values.
     gene_union = set()
     expr_per_source = {}
     for src in all_sources:
@@ -781,7 +772,6 @@ def main(config):
         panel_use_morph,
     )
 
-    # Per-gene global means from available values
     gene_means = {}
     for g in gene_names:
         vals = []
@@ -794,43 +784,6 @@ def main(config):
     gene_means_series = pd.Series(gene_means)
     gene_means_vec = gene_means_series.to_numpy()
     use_expr_baseline = bool(getattr(opts.training, "use_expr_baseline", False))
-    gene_weight_max = float(getattr(opts.training, "gene_weight_max", 5.0))
-    gene_weight_min = float(getattr(opts.training, "gene_weight_min", 0.5))
-    # Per-gene variance weights to emphasize informative genes
-    try:
-        vals_all = []
-        for df_expr_tmp in expr_per_source.values():
-            vals_all.append(df_expr_tmp.reindex(columns=gene_names).to_numpy(dtype=np.float32))
-        if vals_all:
-            expr_concat = np.concatenate(vals_all, axis=0)
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore", category=RuntimeWarning)
-                gene_var = np.nanvar(expr_concat, axis=0)
-            finite_var_mask = np.isfinite(gene_var)
-            if finite_var_mask.any():
-                mean_var = float(np.mean(gene_var[finite_var_mask]))
-                if not np.isfinite(mean_var) or mean_var <= 0.0:
-                    mean_var = 1.0
-                gene_var = gene_var / max(mean_var, 1e-8)
-            else:
-                gene_var = np.ones(len(gene_names), dtype=np.float32)
-            neutral_fill_count = int((~np.isfinite(gene_var)).sum())
-            gene_var = np.where(np.isfinite(gene_var), gene_var, 1.0)
-            gene_var = np.clip(gene_var, gene_weight_min, gene_weight_max)
-            gene_weights_torch = torch.from_numpy(gene_var.astype(np.float32)).to(device)
-            logging.info(
-                "Using per-gene variance weights; min %.3f max %.3f mean %.3f neutral_filled=%d/%d",
-                float(gene_var.min()),
-                float(gene_var.max()),
-                float(gene_var.mean()),
-                neutral_fill_count,
-                len(gene_names),
-            )
-        else:
-            gene_weights_torch = None
-    except Exception as exc:
-        logging.warning("Failed to compute gene variance weights: %s", exc)
-        gene_weights_torch = None
     if use_expr_baseline:
         baseline_torch = torch.from_numpy(gene_means_vec.astype(np.float32)).float().to(device)
         logging.info("Using per-gene baseline for delta training (breast_all)")
@@ -840,7 +793,6 @@ def main(config):
     holdout_genes_by_slide = {}
     holdout_mask_by_slide = {}
 
-    # Cell-type specific means for imputing missing genes (fallback to global means)
     ct_means = None
     ct_means_fallback = None
     ct_series_map = {}
@@ -871,15 +823,12 @@ def main(config):
                     .astype(int)
                 )
                 return mapped
-            # numeric: accept either 0..K-1 or 1..K coding
             ct_vals = ct_numeric.astype(int)
             if ct_vals.min() >= 1 and ct_vals.max() <= len(classes):
                 ct_vals = ct_vals - 1
             ct_vals = ct_vals.clip(lower=0, upper=len(classes) - 1)
             return ct_vals
 
-        # Decide which genes to hold out per train/val slide (measured genes only)
-        # NOTE: This is only used for explicit holdout-vs-GT evaluation.
         if holdout_n_genes_eval > 0:
             def _svg_scores_for_slide(src, df_expr_local, present_genes):
                 """
@@ -903,7 +852,6 @@ def main(config):
                     if cell_ids_all.size == 0:
                         return None
 
-                    # Deterministic sampling for speed.
                     rng = np.random.default_rng(
                         holdout_seed
                         + int(getattr(src, "slide_idx", 0)) * 10007
@@ -941,8 +889,6 @@ def main(config):
                 present = [g for g in df_expr_tmp.columns.tolist() if g in gene_names]
                 if not present:
                     continue
-                # Choose genes with real variation on this slide so evaluation is meaningful.
-                # Use the same expression scale as training targets: expr_scale * log1p(counts).
                 ct_series_tmp = _load_ct_series(getattr(src, "fp_cell_type", None))
                 idx = (
                     df_expr_tmp.index.intersection(ct_series_tmp.index)
@@ -958,8 +904,6 @@ def main(config):
                 var = np.var(expr_target, axis=0)
                 nonzero = (expr_arr > 0).sum(axis=0)
 
-                # Prefer "top SVG" holdout genes but avoid extremely sparse genes.
-                # We target a reasonable detection rate first (>=5% nonzero), then relax if needed.
                 n_cells = int(expr_arr.shape[0])
                 min_nonzero = max(5, int(0.05 * n_cells))
                 cand_mask = (var > 0.0) & (nonzero >= min_nonzero)
@@ -979,7 +923,6 @@ def main(config):
                             chosen.append(present[int(j)])
                             if len(chosen) >= holdout_n_genes_eval:
                                 break
-                    # If still short, fill remaining from SVG order without the detection filter.
                     if len(chosen) < holdout_n_genes_eval:
                         for j in order:
                             g = present[int(j)]
@@ -988,7 +931,6 @@ def main(config):
                                 if len(chosen) >= holdout_n_genes_eval:
                                     break
                 else:
-                    # Fallback: pick high-variance genes with detection filtering.
                     order = np.argsort(-var)
                     for j in order:
                         if cand_mask[j]:
@@ -1024,7 +966,6 @@ def main(config):
                     ", ".join(chosen),
                 )
 
-        # Cache cell-type series for all sources; statistics fit must use stats_sources only.
         for src in all_sources:
             ct_series_tmp = _load_ct_series(getattr(src, "fp_cell_type", None))
             if ct_series_tmp is None:
@@ -1052,14 +993,12 @@ def main(config):
 
         with np.errstate(divide="ignore", invalid="ignore"):
             ct_means = np.divide(ct_sums, ct_counts_arr, where=ct_counts_arr > 0)
-        # fallback to global means where a class never had a value for a gene
         ct_means_fallback = np.where(
             ct_counts_arr > 0,
             ct_means,
             np.broadcast_to(gene_means_vec, ct_means.shape),
         )
 
-    # Build avgexp priors in target scale (expr_scale * log1p(counts)).
     avgexp_df_by_slide = {}
     if use_avgexp and use_celltype and classes:
         avgexp_df_by_slide = reference_utils.build_avgexp_df_by_slide(
@@ -1097,7 +1036,6 @@ def main(config):
         elif isinstance(src_obj, dict):
             src = SimpleNamespace(**src_obj)
         else:
-            # fall back to attribute lookup
             src = SimpleNamespace(
                 slide_idx=getattr(src_obj, "slide_idx", -1),
                 domain_id=getattr(src_obj, "domain_id", 0),
@@ -1118,7 +1056,6 @@ def main(config):
         mask_out = os.path.join(
             impute_dir, f"{kind}_slide{src.slide_idx}_domain{src.domain_id}_mask.npy"
         )
-        # Fast restart path: reuse existing imputed files to keep dataset-cache mtimes stable.
         can_reuse = (not force_reimpute) and os.path.isfile(expr_out) and os.path.isfile(mask_out)
         if can_reuse:
             src.fp_expr = expr_out
@@ -1136,21 +1073,17 @@ def main(config):
             )
             return src, df_ref_cached
 
-        # expr
         src_expr_key = src.fp_expr
         df_expr = pd.read_csv(src_expr_key, index_col=0)
         missing_expr = [g for g in gene_names if g not in df_expr.columns]
         mask_vec = np.ones(len(gene_names), dtype=np.float32)
         for g in missing_expr:
             mask_vec[gene_names.index(g)] = 0.0
-        # Hold out measured genes (evaluate imputation on them)
         if kind == "trainval":
             for g in holdout_genes_by_slide.get(slide_id_local, []):
                 if g in gene_names:
                     mask_vec[gene_names.index(g)] = 0.0
-        # Reindex to union genes
         df_expr = df_expr.reindex(columns=gene_names)
-        # Fill missing with CT-specific means where available, else global means
         if use_celltype and ct_means_fallback is not None:
             ct_series = ct_series_map.get(src_expr_key)
             df_expr_np = df_expr.to_numpy(dtype=np.float32)
@@ -1172,7 +1105,6 @@ def main(config):
                 df_expr = df_expr.fillna(gene_means_series).copy()
         else:
             df_expr = df_expr.fillna(gene_means_series).copy()
-        # Track how many genes were actually present
         present_frac = 1.0 - (mask_vec == 0).mean()
         logging.debug(
             "Slide %s kind %s: %d/%d genes present (%.2f%%)",
@@ -1182,7 +1114,6 @@ def main(config):
             len(mask_vec),
             present_frac * 100,
         )
-        # ensure indices stay numeric to match nuclei IDs
         try:
             df_expr.index = df_expr.index.astype(int)
         except Exception:
@@ -1202,13 +1133,11 @@ def main(config):
                     for g in holdout_genes:
                         handle.write(f"{g}\n")
 
-        # avgexp
         df_ref = None
         if use_avgexp and use_celltype:
             df_ref = avgexp_df_by_slide.get(slide_id_local)
         return src, df_ref
 
-    # Impute and rewrite sources
     imputed_trainval = []
     imputed_refs = []
     expr_ref_map = {}
@@ -1226,11 +1155,9 @@ def main(config):
         if df_ref is not None:
             expr_ref_map[src_out.slide_idx] = df_ref
 
-    # Use local imputed source lists
     train_sources = imputed_trainval
     test_sources = imputed_test
 
-    # Optional global cell-coordinate maps per slide for cross-patch graph construction.
     slide_coord_map_by_slide = {}
     for src in (train_sources + test_sources):
         sid = int(getattr(src, "slide_idx", -1))
@@ -1249,7 +1176,6 @@ def main(config):
             "graph will fall back to within-patch connectivity."
         )
 
-    # Build per-slide avgexp references
     expr_ref_torch_map = {}
     if use_avgexp and imputed_refs:
         ref_counts = []
@@ -1257,7 +1183,6 @@ def main(config):
         for slide_id, df_ref_tmp in expr_ref_map.items():
             df_aligned = df_ref_tmp.reindex(columns=gene_names)
             ref_counts.append(df_aligned.shape[0])
-            # df_ref_tmp is already in target scale (expr_scale * log1p(counts))
             ref_np = df_aligned.to_numpy(dtype=np.float32)
             expr_ref_torch_map[slide_id] = torch.from_numpy(ref_np).float().to(device)
             ref_stack.append(ref_np)
@@ -1272,13 +1197,11 @@ def main(config):
         if n_ref <= 0:
             raise ValueError("Avgexp references found but none valid (n_ref <= 0).")
 
-        # Default ref: mean over slides, preserve ref dimension (n_ref, n_genes)
-        ref_stack_arr = np.stack(ref_stack, axis=0)  # (n_slides, n_ref, n_genes)
+        ref_stack_arr = np.stack(ref_stack, axis=0)
         expr_ref_mean = np.nanmean(ref_stack_arr, axis=0)
         expr_ref_torch = torch.from_numpy(expr_ref_mean).float().to(device)
         logging.info("Using avgexp with %d reference(s) per slide", n_ref)
     elif use_avgexp:
-        # Fallback: no avgexp loaded, use zeros to avoid crash
         expr_ref_mean = np.zeros((1, len(gene_names)), dtype=np.float32)
         expr_ref_torch = torch.from_numpy(expr_ref_mean).float().to(device)
         n_ref = 1
@@ -1295,7 +1218,6 @@ def main(config):
         for line in gene_names:
             f.write(f"{line}\n")
 
-    # Best imputation: allow model to predict residual over avgexp prior
     if use_avgexp and hasattr(opts, "model"):
         try:
             if float(getattr(opts.model, "avgexp_residual_scale", 0.0)) <= 0.0:
@@ -1340,7 +1262,6 @@ def main(config):
             morph_gate_init=panel_morph_gate_init,
         )
 
-    # Some frameworks accept cell-graph kwargs; detect once and avoid per-batch try/except.
     try:
         fwd_params = inspect.signature(model.forward).parameters
         supports_cell_graph = all(
@@ -1351,7 +1272,6 @@ def main(config):
     logging.info("Cell-graph support: %s", supports_cell_graph)
     model.to(device)
 
-    # Dataloader
     logging.info("Preparing data")
 
     regions_train = getattr(opts, "regions_train", None)
@@ -1446,7 +1366,6 @@ def main(config):
             )
 
     immune_sampler_boost = float(getattr(opts.training, "immune_sampler_boost", 1.0))
-    # Derive a boost automatically if none provided (>1 only when immune classes are rare)
     if immune_sampler_boost <= 1.0 and use_celltype:
         try:
             counts = np.zeros(n_classes, dtype=np.int64)
@@ -1466,7 +1385,6 @@ def main(config):
             if immune_counts.size > 0 and immune_counts.max() > 0:
                 max_boost = float(getattr(opts.training, "sampler_weight_cap", 3.0))
                 rare_ratio = immune_counts.max() / max(immune_counts.min(), 1)
-                # bias toward modest bump; cap to keep sampling stable
                 immune_sampler_boost = min(max_boost, max(1.0, rare_ratio))
                 logging.info(
                     "Auto immune_sampler_boost=%.2f (rare_ratio=%.2f, cap=%.2f)",
@@ -1498,8 +1416,6 @@ def main(config):
         )
         train_datasets.append(ds)
 
-    # Apply adaptive immune balancing per slide before concatenation so each
-    # slide's patch weights reflect its own class rarity profile.
     def _auto_immune_multipliers(ds, immune_idx, classes_all):
         if not immune_idx or not hasattr(ds, "df_ct") or "ct" not in ds.df_ct.columns:
             return {}
@@ -1595,7 +1511,6 @@ def main(config):
             sampler = None
 
     if use_batch_sampler:
-        # batches is already a list of index lists; feed directly to DataLoader
         train_loader_kwargs = {
             "batch_sampler": batches,
             "num_workers": opts.data.num_workers,
@@ -1611,7 +1526,6 @@ def main(config):
             "drop_last": True,
             "pin_memory": getattr(opts.data, "pin_memory", False),
         }
-    # Keep workers alive and prefetch when using multiple workers
     if train_loader_kwargs["num_workers"] and train_loader_kwargs["num_workers"] > 0:
         train_loader_kwargs["persistent_workers"] = True
         train_loader_kwargs["prefetch_factor"] = getattr(opts.data, "prefetch_factor", 2)
@@ -1741,7 +1655,6 @@ def main(config):
         return DataLoader(**kwargs)
 
     try:
-        # Validation is computed on train/val sources.
         val_dataloader = _make_eval_loader(train_sources, opts.regions_val, mode_name="val")
     except Exception as exc:
         logging.warning("Validation loader creation failed: %s", exc)
@@ -1754,7 +1667,6 @@ def main(config):
         logging.warning("External loader creation failed: %s", exc)
         external_dataloader = None
 
-    # Fixed SVG ranks (Giotto-ranked) per slide for log-time top-k reporting.
     svg_topk = (20, 50)
     svg_knn_k = 8
     svg_sample_cap = 3000
@@ -1785,7 +1697,6 @@ def main(config):
         svg_sample_cap,
     )
 
-    # Optimiser
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=opts.training.learning_rate,
@@ -1794,15 +1705,11 @@ def main(config):
         eps=opts.training.eps,
     )
 
-    global_step = 0
-
-    # Starting epoch
     if config.resume_epoch != 0:
         initial_epoch = config.resume_epoch
     else:
         initial_epoch = 0
 
-    # Restore saved model
     if config.resume_epoch != 0:
         logging.info("Resume training")
 
@@ -1859,100 +1766,38 @@ def main(config):
 
     zero_weight = float(getattr(opts.training, "zero_weight", 0.1))
     zero_threshold = float(getattr(opts.training, "zero_threshold", 0.0))
-    # Correlation is carried by the explicit Pearson term below; keep the
-    # reconstruction loss purely MSE-like here to avoid double-counting.
-    corr_loss_weight = 0.0
     pearson_loss_weight = float(getattr(opts.training, "pearson_loss_weight", 1.0))
     expr_ct_embed_loss_weight = float(
         getattr(opts.training, "expr_ct_embed_loss_weight", 1.0)
     )
     logits_loss_weight = float(getattr(opts.training, "logits_loss_weight", 1.0))
-    bulk_loss_weight = float(getattr(opts.training, "bulk_loss_weight", 0.0))
     logging.info(
-        "Loss setup: corr=%.3f pearson=%.3f expr_ct_embed_w=%.3f "
-        "logits_w=%.3f bulk=%.3f expr_ct_embed_internal=100 "
+        "Loss setup: pearson=%.3f expr_ct_embed_w=%.3f "
+        "logits_w=%.3f expr_ct_embed_internal=100 "
         "interleave_slide_batches=%s",
-        corr_loss_weight,
         pearson_loss_weight,
         expr_ct_embed_loss_weight,
         logits_loss_weight,
-        bulk_loss_weight,
         str(bool(getattr(opts.training, "interleave_slide_batches", True))),
     )
-    gene_weights_torch = None
 
     def expr_loss_weighted(pred, target, mask=None):
         """
-        Expression loss = zero-aware weighted MSE + correlation (shape) loss.
-        - Down-weights near-zero targets so the model is not rewarded for predicting zeros.
-        - Adds a correlation term to focus on the shape of the gene vector.
-        Preserves existing masking for missing genes.
+        Expression loss = zero-aware weighted MSE with existing missing-gene masking.
         """
         w_zero = pred.new_tensor(zero_weight)
         w_one = pred.new_tensor(1.0)
         w = torch.where(target > zero_threshold, w_one, w_zero)
         if mask is not None:
             w = w * mask
-        if gene_weights_torch is not None and gene_weights_torch.numel() == pred.shape[1]:
-            w = w * gene_weights_torch.view(1, -1)
         mse_num = ((pred - target) ** 2 * w).sum()
         mse_den = w.sum().clamp_min(1e-8)
         loss_mse_val = mse_num / mse_den
 
-        loss_corr_val = metric_utils.masked_pearson(pred, target, mask)
-        return loss_mse_val + corr_loss_weight * loss_corr_val
+        return loss_mse_val
 
     def masked_mse(pred, target, mask):
-        # expr_loss_weighted already normalises by sum of weights and handles masks.
         return expr_loss_weighted(pred, target, mask)
-
-    def pseudo_bulk_mse(pred, target, mask, group_ids):
-        """
-        Compute MSE between group-level means (pseudo-bulk). Groups can be slide
-        or slide+celltype to respect biological structure.
-        """
-        if pred.numel() == 0:
-            return torch.tensor(0.0, device=pred.device)
-
-        uniq = torch.unique(group_ids)
-        losses = []
-        for gid in uniq:
-            idx = group_ids == gid
-            if mask is None:
-                if not idx.any():
-                    continue
-                pred_mean = pred[idx].mean(dim=0)
-                target_mean = target[idx].mean(dim=0)
-                if gene_weights_torch is not None and gene_weights_torch.numel() == pred_mean.shape[0]:
-                    gw = gene_weights_torch
-                    mse_num = ((pred_mean - target_mean) ** 2 * gw).sum()
-                    mse_den = gw.sum().clamp_min(1e-8)
-                    loss_g = mse_num / mse_den
-                else:
-                    loss_g = F.mse_loss(pred_mean, target_mean, reduction="mean")
-            else:
-                gmask = mask[idx].float()
-                valid = gmask.sum(dim=0)
-                valid_mask = valid > 0
-                if not valid_mask.any():
-                    continue
-                pred_mean = (pred[idx] * gmask).sum(dim=0) / valid.clamp_min(1.0)
-                target_mean = (target[idx] * gmask).sum(dim=0) / valid.clamp_min(1.0)
-                if gene_weights_torch is not None and gene_weights_torch.numel() == pred_mean.shape[0]:
-                    gw = gene_weights_torch
-                    mse_num = ((pred_mean - target_mean) ** 2 * gw).sum()
-                    mse_den = gw.sum().clamp_min(1e-8)
-                    loss_g = mse_num / mse_den
-                else:
-                    loss_g = F.mse_loss(
-                        pred_mean[valid_mask], target_mean[valid_mask], reduction="mean"
-                    )
-            losses.append(loss_g)
-
-        if not losses:
-            return torch.tensor(0.0, device=pred.device)
-
-        return torch.stack(losses).mean()
 
     def masked_var(x, mask):
         if mask is None:
@@ -1986,7 +1831,6 @@ def main(config):
 
     for epoch in range(initial_epoch, total_epochs):
         logging.info("Epoch: %d", epoch + 1)
-        # Encoder stays frozen for the entire run (no unfreeze step)
         model.train()
         if hasattr(model, "set_epoch_progress"):
             total_eps = max(total_epochs - 1, 1)
@@ -1997,20 +1841,6 @@ def main(config):
         )
 
         loss_epoch = 0
-        loss_epoch_map = 0
-        loss_epoch_ct_hist = 0
-        loss_epoch_expr_ct = 0
-        loss_epoch_expr_ct_embed = 0
-        loss_epoch_expr = 0
-        loss_epoch_expr_immune = 0
-        loss_epoch_expr_invasive = 0
-        loss_epoch_expr_bulk = 0
-        loss_epoch_logits = 0
-        loss_epoch_comp_est = 0
-        loss_epoch_comp_gt = 0
-        loss_epoch_pearson = 0
-        loss_epoch_vq = 0
-        loss_epoch_panel_completion = 0
         if use_celltype:
             running_pred_counts = torch.zeros(n_classes, device=device)
             running_gt_counts = torch.zeros(n_classes, device=device)
@@ -2072,7 +1902,6 @@ def main(config):
 
             batch_expr_mask_pc = tensor_utils.flatten_expr_mask(batch_expr_mask, batch_n_cells)
 
-            # Optional: random hiding mask for panel-completion training (defined in per-cell space).
             mask_panel_pc = (
                 batch_expr_mask_pc > 0.5
                 if batch_expr_mask_pc is not None and batch_expr_mask_pc.numel() > 0
@@ -2094,8 +1923,6 @@ def main(config):
             ):
                 mask_hide_pc = (torch.rand_like(batch_expr_mask_pc) < panel_hide_frac) & mask_panel_pc
 
-            # Prevent leakage: for held-out genes (and optionally hidden genes), replace GT expr
-            # with the (non-leaky) ref baseline before calling the model.
             batch_expr_for_model = batch_expr
             holdout_mask_vec = holdout_mask_by_slide.get(slide_id_val)
             need_clone = False
@@ -2206,9 +2033,6 @@ def main(config):
 
             aux_main = getattr(model, "last_aux_losses", {}) or {}
             ref_base_main = aux_main.get("expr_ref_base")
-            # Train the main expression path on full expression rather than
-            # residual-over-reference expression; keep ref_base_main available
-            # for panel completion and other auxiliary terms below.
             pred_expr_for_loss = out_expr
             target_expr_for_loss = batch_expr_pc
             if use_expr_baseline and baseline_torch is not None:
@@ -2218,8 +2042,6 @@ def main(config):
             loss_expr_val = masked_mse(pred_expr_for_loss, target_expr_for_loss, batch_expr_mask_pc)
             loss_map_val = loss_map(out_map, batch_type_patch)
 
-            # Panel completion loss: predict held-out (and optionally randomly hidden) genes
-            # using the measured genes in the same cell as context.
             loss_panel_completion_val = torch.tensor(0.0, device=device)
             if (
                 panel_completion_enabled
@@ -2245,7 +2067,6 @@ def main(config):
                         mask_obs = (mask_panel > 0.5) & (~mask_hide)
                         mask_obs_f = mask_obs.float()
 
-                        # Targets: natural missing genes and/or explicitly hidden genes.
                         mask_target = mask_hide.float()
                         if panel_use_natural_missing:
                             mask_target = torch.maximum(mask_target, (1.0 - mask_panel))
@@ -2436,22 +2257,6 @@ def main(config):
                 loss_expr_immune_val = torch.tensor(0.0).to(device)
                 loss_expr_invasive_val = torch.tensor(0.0).to(device)
 
-            loss_expr_bulk_val = torch.tensor(0.0, device=device)
-            if bulk_loss_weight > 0:
-                if use_celltype and batch_ct_pc.numel() > 0:
-                    # Combine slide_id and cell type to keep pseudo-bulk biologically coherent.
-                    bulk_groups = batch_ct_pc + (slide_id_val + 1) * (n_classes + 1)
-                else:
-                    # Fall back to slide-level pseudo-bulk.
-                    bulk_groups = batch_ct_pc.new_full(
-                        (batch_ct_pc.shape[0],), slide_id_val, dtype=torch.long
-                    )
-                loss_expr_bulk_val = pseudo_bulk_mse(
-                    pred_expr_for_loss, target_expr_for_loss, batch_expr_mask_pc, bulk_groups
-                )
-
-            # The explicit Pearson term is the only active correlation penalty
-            # in train.py; corr_loss_weight is intentionally kept off here.
             pearson_weight_mult = pearson_loss_weight
             if pearson_weight_mult > 0:
                 loss_pearson_val = metric_utils.masked_pearson(
@@ -2462,7 +2267,6 @@ def main(config):
             else:
                 loss_pearson_val = torch.tensor(0.0, device=device)
 
-            # Always define these for the variance-ratio guard below.
             var_pred = masked_var(out_expr, batch_expr_mask_pc)
             var_label = masked_var(batch_expr_pc, batch_expr_mask_pc)
             var_w_cfg = float(getattr(opts.training, "expr_var_penalty_weight", 0.0))
@@ -2471,7 +2275,6 @@ def main(config):
             else:
                 loss_var_val = torch.tensor(0.0, device=device)
 
-            # Entropy regulariser to discourage reference weight collapse
             entropy_w = float(getattr(opts.training, "ref_entropy_weight", 0.0))
             if entropy_w > 0:
                 aux = getattr(model, "last_aux_losses", {})
@@ -2484,7 +2287,6 @@ def main(config):
                 ]
                 if ent_terms:
                     entropy_gain = torch.stack(ent_terms).mean()
-                    # subtract because we want to maximise entropy
                     loss_entropy_val = -entropy_w * entropy_gain
                 else:
                     loss_entropy_val = torch.tensor(0.0, device=device)
@@ -2496,7 +2298,6 @@ def main(config):
                 "vq_patch", torch.tensor(0.0, device=device)
             )
 
-            # sum all losses
             loss = (
                 loss_map_val
                 + loss_ct_hist_val
@@ -2509,7 +2310,6 @@ def main(config):
                 + logits_loss_weight * loss_logits_val
                 + loss_comp_est_val
                 + loss_comp_gt_val
-                + bulk_loss_weight * loss_expr_bulk_val
                 + pearson_weight_mult * loss_pearson_val
                 + loss_var_val
                 + loss_entropy_val
@@ -2518,7 +2318,6 @@ def main(config):
 
             loss_total = loss.detach()
 
-            # Hard guard: skip update on non-finite loss or extreme variance ratio
             var_ratio = float(
                 (var_pred.detach() / var_label.detach().clamp_min(1e-6)).item()
             )
@@ -2546,22 +2345,6 @@ def main(config):
 
             loss_epoch += loss.mean().item()
 
-            loss_epoch_map += loss_map_val.mean().item()
-            loss_epoch_ct_hist += loss_ct_hist_val.mean().item()
-            loss_epoch_expr_ct += loss_expr_ct_val.item()
-            loss_epoch_expr += loss_expr_val.item()
-            loss_epoch_expr_immune += loss_expr_immune_val.item()
-            loss_epoch_expr_invasive += loss_expr_invasive_val.item()
-            loss_epoch_expr_bulk += loss_expr_bulk_val.item()
-            loss_epoch_expr_ct_embed += loss_expr_ct_embed_val.item()
-            loss_epoch_logits += loss_logits_val.item()
-            loss_epoch_comp_est += loss_comp_est_val.item()
-            loss_epoch_comp_gt += loss_comp_gt_val.item()
-            loss_epoch_pearson += loss_pearson_val.item()
-            loss_epoch_vq += loss_vq_val.item()
-            loss_epoch_panel_completion += loss_panel_completion_val.item()
-
-            # Only update description if tqdm is being used
             if hasattr(pbar, "set_description"):
                 pbar.set_description(f"loss: {loss_total:.4f}")
 
@@ -2588,7 +2371,6 @@ def main(config):
                     for idx in range(n_classes)
                 ),
             )
-        # Save model
         ckpt_model_path = None
         if (epoch % opts.save_freqs.model_freq) == 0:
             save_path = f"{experiment_path}/{opts.experiment_dirs.model_dir}/epoch_{epoch+1}_model.pth"
@@ -2745,11 +2527,6 @@ def main(config):
                 best_val_ct_macro,
             )
 
-        # Legacy loader: no immune feedback loop
-
-        global_step += 1
-
-    # df_losses.to_csv(f"{experiment_path}/losses.csv")
 
     strict_best = {
         "selection_metric": "pearson_gene_pooled_mean",

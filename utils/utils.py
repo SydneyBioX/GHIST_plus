@@ -4,9 +4,7 @@ import os
 import datetime as dt
 import json
 import collections
-import re
 import torch
-import numpy as np
 import natsort
 
 
@@ -23,45 +21,10 @@ def get_device(gpu_id):
     return device
 
 
-def sorted_alphanumeric(data):
-    """
-    Alphanumerically sort a list
-    """
-    convert = lambda text: int(text) if text.isdigit() else text.lower()
-    alphanum_key = lambda key: [convert(c) for c in re.split("([0-9]+)", key)]
-    return sorted(data, key=alphanum_key)
-
-
 def read_txt(fp):
     with open(fp) as file:
         lines = [line.rstrip() for line in file]
     return lines
-
-
-def delete_file(path):
-    """
-    Delete file if exists
-    """
-    if os.path.exists(path):
-        os.remove(path)
-
-
-def get_files_list(path, ext_array=[".tif"]):
-    """
-    Get all files in a directory with a specific extension
-    """
-    files_list = list()
-    dirs_list = list()
-
-    for root, dirs, files in os.walk(path, topdown=True):
-        for file in files:
-            if any(x in file for x in ext_array):
-                files_list.append(os.path.join(root, file))
-                folder = os.path.dirname(os.path.join(root, file))
-                if folder not in dirs_list:
-                    dirs_list.append(folder)
-
-    return files_list, dirs_list
 
 
 def json_file_to_pyobj(filename):
@@ -128,16 +91,3 @@ def get_experiment_id(make_new, load_dir, fold_id):
         )
 
     return timestamp
-
-
-def normalise_counts(df):
-    total_counts_per_cell = df.sum(axis=1)
-
-    scale_factor = 10000
-    df_normalized = df.div(total_counts_per_cell, axis=0) * scale_factor
-
-    df_normalized_with_pseudo = df_normalized + 1
-
-    df_log_transformed = np.log(df_normalized_with_pseudo)
-
-    return df_log_transformed
