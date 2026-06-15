@@ -31,15 +31,6 @@ def evaluate_validation(
     svg_rank_gene_indices_by_slide=None,
     svg_topk=(20, 50),
 ):
-    def masked_mse(pred, target, mask):
-        if mask is None:
-            return F.mse_loss(pred, target, reduction="mean")
-        mask = mask.float()
-        denom = mask.sum()
-        if denom <= 0:
-            return torch.tensor(0.0, device=pred.device)
-        return torch.sum((pred - target) ** 2 * mask) / denom
-
     model.eval()
     holdout_sse = 0.0
     holdout_sae = 0.0
@@ -104,7 +95,7 @@ def evaluate_validation(
     with torch.no_grad():
         for (
             batch_nuclei,
-            batch_type_patch,
+            _,
             batch_he_img,
             batch_expr,
             batch_n_cells,
@@ -175,17 +166,17 @@ def evaluate_validation(
 
             (
                 out_cell_type,
-                out_map,
+                _,
                 batch_ct_pc,
                 out_expr,
-                out_expr_immune,
-                out_expr_invasive,
-                out_cell_type_expr,
-                fv_cell_type_expr,
-                out_cell_type_gt_expr,
-                fv_cell_type_gt_expr,
+                _,
+                _,
+                _,
+                _,
+                _,
+                _,
                 batch_expr_pc,
-                comp_estimated,
+                _,
                 _,
                 _,
             ) = model(
