@@ -124,10 +124,15 @@ class Framework(nn.Module):
             self.cnn = LegacyBackbone(
                 n_channels=in_channels, n_classes=n_classes_backbone
             )
-        self._encoder_blocks = self._find_vit_blocks()
+        self.encoder_warmup_epochs = 0
+        self._encoder_trainable_blocks = 0
+        self._encoder_blocks = (
+            self._find_vit_blocks(self.cnn) if self.use_foundation_model else None
+        )
+        self._encoder_unfrozen = False
         self.freeze_backbone = self.use_foundation_model or self.legacy_backbone_frozen
         if self.freeze_backbone:
-            self._freeze_encoder()
+            self._freeze_encoder(0)
             self.cnn.eval()
 
         # feature vector layout: per-cell hd1/h1 + tile-level hd1/h1
@@ -396,19 +401,53 @@ class Framework(nn.Module):
             out_expr = self.relu(out_expr)
         return out_expr, gate, ref_corr
 
-    def _freeze_encoder(self):
+    def _freeze_encoder(self, trainable_blocks: int = 0):
         for p in self.cnn.parameters():
             p.requires_grad = False
-
-    def _find_vit_blocks(self):
-        if not self.use_foundation_model:
-            return nn.ModuleList()
-        enc = getattr(self.cnn, "enc", None)
-        vit = getattr(enc, "vit", None)
-        blocks = getattr(vit, "blocks", None)
+        if trainable_blocks <= 0:
+            return
+        blocks = self._encoder_blocks or self._find_vit_blocks(self.cnn)
         if blocks is None:
-            return nn.ModuleList()
-        return nn.ModuleList(list(blocks))
+            print("[warn] Uni2H blocks not found; encoder remains frozen.")
+            return
+        trainable_blocks = min(trainable_blocks, len(blocks))
+        for blk in blocks[-trainable_blocks:]:
+            for p in blk.parameters():
+                p.requires_grad = True
+
+    @staticmethod
+    def _find_vit_blocks(module):
+        candidates = [
+            "enc.vit.blocks",
+            "enc.blocks",
+            "backbone.blocks",
+            "blocks",
+            "encoder.blocks",
+            "encoder.layer",
+            "model.blocks",
+            "vit.blocks",
+        ]
+        for chain in candidates:
+            obj = module
+            ok = True
+            for attr in chain.split("."):
+                if hasattr(obj, attr):
+                    obj = getattr(obj, attr)
+                else:
+                    ok = False
+                    break
+            if ok and isinstance(obj, (list, nn.ModuleList, nn.Sequential)):
+                return obj
+        return None
+
+    def unfreeze_encoder(self):
+        if not self.use_foundation_model:
+            return
+        if self._encoder_unfrozen:
+            return
+        self._freeze_encoder(self._encoder_trainable_blocks)
+        self._encoder_unfrozen = True
+        self.freeze_backbone = False
 
     def train(self, mode: bool = True):
         super().train(mode)
