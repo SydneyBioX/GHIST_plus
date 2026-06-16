@@ -124,6 +124,7 @@ class Framework(nn.Module):
             self.cnn = LegacyBackbone(
                 n_channels=in_channels, n_classes=n_classes_backbone
             )
+        self._encoder_blocks = self._find_vit_blocks()
         self.freeze_backbone = self.use_foundation_model or self.legacy_backbone_frozen
         if self.freeze_backbone:
             self._freeze_encoder()
@@ -398,6 +399,16 @@ class Framework(nn.Module):
     def _freeze_encoder(self):
         for p in self.cnn.parameters():
             p.requires_grad = False
+
+    def _find_vit_blocks(self):
+        if not self.use_foundation_model:
+            return nn.ModuleList()
+        enc = getattr(self.cnn, "enc", None)
+        vit = getattr(enc, "vit", None)
+        blocks = getattr(vit, "blocks", None)
+        if blocks is None:
+            return nn.ModuleList()
+        return nn.ModuleList(list(blocks))
 
     def train(self, mode: bool = True):
         super().train(mode)
