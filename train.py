@@ -1829,24 +1829,6 @@ def main(config):
             else:
                 loss_var_val = torch.tensor(0.0, device=device)
 
-            entropy_w = float(getattr(opts.training, "ref_entropy_weight", 0.0))
-            if entropy_w > 0:
-                aux = getattr(model, "last_aux_losses", {})
-                ent_base = aux.get("ref_weight_entropy")
-                ent_imm = aux.get("ref_weight_entropy_immune")
-                ent_inv = aux.get("ref_weight_entropy_invasive")
-                ent_terms = [
-                    x for x in (ent_base, ent_imm, ent_inv)
-                    if x is not None and torch.isfinite(x)
-                ]
-                if ent_terms:
-                    entropy_gain = torch.stack(ent_terms).mean()
-                    loss_entropy_val = -entropy_w * entropy_gain
-                else:
-                    loss_entropy_val = torch.tensor(0.0, device=device)
-            else:
-                loss_entropy_val = torch.tensor(0.0, device=device)
-
             aux_losses = getattr(model, "last_aux_losses", {})
             loss_vq_val = aux_losses.get(
                 "vq_patch", torch.tensor(0.0, device=device)
@@ -1866,7 +1848,6 @@ def main(config):
                 + loss_comp_gt_val
                 + pearson_weight_mult * loss_pearson_val
                 + loss_var_val
-                + loss_entropy_val
                 + loss_vq_val
             )
 

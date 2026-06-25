@@ -97,7 +97,6 @@
         "expr_ct_embed_loss_weight": 1.0,
         "logits_loss_weight": 1.0,
         "expr_var_penalty_weight": 0.0,
-        "ref_entropy_weight": 0,
         "immune_sampler_boost": 1.5,
         "use_expr_baseline": false,
         "holdout_n_genes": 0,

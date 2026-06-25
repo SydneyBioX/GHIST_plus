@@ -758,9 +758,6 @@ class Framework(nn.Module):
             )
 
         # --- Expression heads ------------------------------------------------
-        ref_weight_entropy = None
-        ref_weight_entropy_immune = None
-        ref_weight_entropy_invasive = None
         expr_ref_gate = None
         expr_ref_gate_immune = None
         expr_ref_gate_invasive = None
@@ -772,10 +769,6 @@ class Framework(nn.Module):
             ref_weights = self._resolve_ref_weights(
                 self.mlp_weights(embeddings), ct_prob_pred, ct_labels
             )
-            if ref_weights.numel() > 0 and ref_weights.shape[1] > 1:
-                ref_weight_entropy = -(
-                    ref_weights.clamp_min(1e-8) * ref_weights.clamp_min(1e-8).log()
-                ).sum(dim=1).mean() / math.log(ref_weights.shape[1])
 
             if (
                 self.use_ecrm
@@ -856,11 +849,6 @@ class Framework(nn.Module):
             ref_weights_immune = self._resolve_ref_weights(
                 self.mlp_weights_immune(embeddings), ct_prob_pred, ct_labels
             )
-            if ref_weights_immune.numel() > 0 and ref_weights_immune.shape[1] > 1:
-                ref_weight_entropy_immune = -(
-                    ref_weights_immune.clamp_min(1e-8)
-                    * ref_weights_immune.clamp_min(1e-8).log()
-                ).sum(dim=1).mean() / math.log(ref_weights_immune.shape[1])
             ref_immune = torch.sum(ref_weights_immune.unsqueeze(-1) * ref, dim=1)
             ref_offsets_immune = None
             if self.use_crossattn and comp_tiled_all is not None:
@@ -886,11 +874,6 @@ class Framework(nn.Module):
             ref_weights_invasive = self._resolve_ref_weights(
                 self.mlp_weights_invasive(embeddings), ct_prob_pred, ct_labels
             )
-            if ref_weights_invasive.numel() > 0 and ref_weights_invasive.shape[1] > 1:
-                ref_weight_entropy_invasive = -(
-                    ref_weights_invasive.clamp_min(1e-8)
-                    * ref_weights_invasive.clamp_min(1e-8).log()
-                ).sum(dim=1).mean() / math.log(ref_weights_invasive.shape[1])
             ref_invasive = torch.sum(ref_weights_invasive.unsqueeze(-1) * ref, dim=1)
             ref_offsets_invasive = None
             if self.use_crossattn and comp_tiled_all is not None:
@@ -1023,9 +1006,6 @@ class Framework(nn.Module):
             "expr_ref_base": ref_weighted if self.use_avgexp and ref_orig is not None else None,
             "expr_ref_base_immune": ref_immune if self.use_avgexp and ref_orig is not None else None,
             "expr_ref_base_invasive": ref_invasive if self.use_avgexp and ref_orig is not None else None,
-            "ref_weight_entropy": ref_weight_entropy,
-            "ref_weight_entropy_immune": ref_weight_entropy_immune,
-            "ref_weight_entropy_invasive": ref_weight_entropy_invasive,
             "expr_ref_gate": expr_ref_gate,
             "expr_ref_gate_immune": expr_ref_gate_immune,
             "expr_ref_gate_invasive": expr_ref_gate_invasive,
