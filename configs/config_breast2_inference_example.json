@@ -71,9 +71,7 @@
             "cross_patch": true,
             "edge_dropout": 0.05,
             "message_dropout": 0.05,
-            "residual_gate_init": -1.4,
-            "apply_to_ref_weights": false,
-            "apply_to_expr_residual": true
+            "residual_gate_init": -1.4
         },
         "vq_patch": {
             "enabled": true,
