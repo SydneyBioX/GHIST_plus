@@ -2,8 +2,6 @@
     "comps": {
         "avgexp": true,
         "celltype": true,
-        "crossattn": true,
-        "use_neighb": true,
         "neighb": true
     },
     "stain_norm": {
@@ -44,14 +42,11 @@
     },
     "model": {
         "emb_dim": 1024,
-        "avgexp_temp": 1.0,
         "avgexp_residual_scale": 0,
-        "refiner_query_tokens": 8,
         "ecrm": {
             "k_target": 12,
             "k_min": 6,
             "k_max": 16,
-            "graph_k": 12,
             "cross_patch_k": 8,
             "density_gamma": 0.4,
             "eta_max": 0.6,
@@ -69,11 +64,8 @@
         "vq_patch": {
             "enabled": true,
             "n_codes": 64,
-            "beta": 0.25,
-            "use_cosine": true,
             "loss_w": 0.05
-        },
-        "ct_priors_ecrm_unit_enabled": true
+        }
     },
     "training": {
         "batch_size": 64,
@@ -86,14 +78,8 @@
         "stain_aug": true,
         "pearson_loss_weight": 0.25,
         "expr_var_penalty_weight": 0.05,
-        "ref_entropy_weight": 0,
         "immune_sampler_boost": 1.5,
-        "use_expr_baseline": false,
         "holdout_n_genes": 0
-    },
-    "evaluation": {
-        "parity_tolerance_abs": 0.001,
-        "external_source": "data_sources_test"
     },
     "save_freqs": {
         "model_freq": 1
