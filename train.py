@@ -907,6 +907,36 @@ def main(config):
                 "Validation train-region avgexp refs could not be built; using standard refs.",
             )
 
+    immune_sampler_boost = float(getattr(opts.training, "immune_sampler_boost", 1.0))
+    if immune_sampler_boost <= 1.0 and use_celltype:
+        try:
+            counts = np.zeros(n_classes, dtype=np.int64)
+            ct_to_idx = {name: idx for idx, name in enumerate(classes)}
+            for src in train_sources:
+                df_ct_counts = pd.read_csv(
+                    src.fp_cell_type, index_col="c_id"
+                )["ct"].astype(str)
+                ct_indices = df_ct_counts.map(lambda x: ct_to_idx.get(x, None))
+                counts += np.bincount(
+                    np.array([c for c in ct_indices if c is not None], dtype=int),
+                    minlength=n_classes,
+                )
+            immune_counts = (
+                counts[immune_class_indices] if immune_class_indices else np.array([])
+            )
+            if immune_counts.size > 0 and immune_counts.max() > 0:
+                max_boost = float(getattr(opts.training, "sampler_weight_cap", 3.0))
+                rare_ratio = immune_counts.max() / max(immune_counts.min(), 1)
+                immune_sampler_boost = min(max_boost, max(1.0, rare_ratio))
+                logging.info(
+                    "Auto immune_sampler_boost=%.2f (rare_ratio=%.2f, cap=%.2f)",
+                    immune_sampler_boost,
+                    rare_ratio,
+                    max_boost,
+                )
+        except Exception as exc:
+            logging.warning("Failed to derive immune_sampler_boost automatically: %s", exc)
+
     train_datasets = []
     for src in train_sources:
         src_ns = src if isinstance(src, SimpleNamespace) else SimpleNamespace(**src)
@@ -923,34 +953,120 @@ def main(config):
             opts.training.stain_aug,
             config.fold_id,
             mode="train",
-            immune_sampler_boost=1.0,
+            immune_sampler_boost=immune_sampler_boost,
             immune_class_multipliers=None,
         )
         train_datasets.append(ds)
 
+    def _auto_immune_multipliers(ds, immune_idx, classes_all):
+        if not immune_idx or not hasattr(ds, "df_ct") or "ct" not in ds.df_ct.columns:
+            return {}
+        try:
+            ct_series = ds.df_ct["ct"].astype(int) - 1
+            counts = np.bincount(
+                ct_series.clip(lower=0), minlength=len(classes_all)
+            ).astype(float)
+            immune_counts = counts[immune_idx]
+            if immune_counts.sum() <= 0:
+                return {}
+            props = immune_counts / immune_counts.sum()
+            target = np.ones_like(props) / len(props)
+            beta = float(getattr(opts.training, "sampler_multiplier_beta", 0.5))
+            m_min = float(getattr(opts.training, "sampler_multiplier_min", 0.7))
+            m_max = float(getattr(opts.training, "sampler_multiplier_max", 1.5))
+            ratio = target / np.maximum(props, 1e-8)
+            mult = np.power(ratio, beta)
+            mult = np.clip(mult, m_min, m_max)
+            keys = [idx + 1 for idx in immune_idx]
+            multipliers = {k: float(v) for k, v in zip(keys, mult)}
+            logging.info(
+                "Auto immune multipliers for slide=%s (beta=%.2f, min=%.2f, max=%.2f): %s",
+                getattr(ds, "slide_idx", "unknown"),
+                beta,
+                m_min,
+                m_max,
+                multipliers,
+            )
+            return multipliers
+        except Exception as exc:
+            logging.warning(
+                "Failed to derive immune multipliers for slide=%s: %s",
+                getattr(ds, "slide_idx", "unknown"),
+                exc,
+            )
+            return {}
+
+    for ds in train_datasets:
+        immune_multipliers = _auto_immune_multipliers(
+            ds, immune_class_indices, classes
+        )
+        if immune_multipliers:
+            ds.set_immune_sampling_multipliers(immune_multipliers)
+        ds.refresh_patch_sampling_weights(immune_sampler_boost)
+
     if len(train_datasets) == 0:
         raise ValueError("No training slides could be loaded (all skipped).")
-    train_dataset = (
-        train_datasets[0]
-        if len(train_datasets) == 1
-        else torch.utils.data.ConcatDataset(train_datasets)
-    )
-    batches = sampler_utils.slide_batch_sampler(
-        train_datasets,
-        opts.training.batch_size,
-        shuffle_batches=True,
-    )
-    logging.info(
-        "Using spatial slide batch sampler: slides=%d batch_size=%d shuffle_batches=True",
-        len(train_datasets),
-        int(opts.training.batch_size),
-    )
-    train_loader_kwargs = {
-        "batch_sampler": batches,
-        "num_workers": opts.data.num_workers,
-        "drop_last": False,
-        "pin_memory": getattr(opts.data, "pin_memory", False),
-    }
+    if len(train_datasets) == 1:
+        train_dataset = train_datasets[0]
+        use_batch_sampler = False
+        batches = None
+    else:
+        train_dataset = torch.utils.data.ConcatDataset(train_datasets)
+        batches = sampler_utils.slide_batch_sampler(
+            train_datasets,
+            opts.training.batch_size,
+            opts.training,
+            interleave=bool(getattr(opts.training, "interleave_slide_batches", True)),
+        )
+        use_batch_sampler = True
+
+    sampler = None
+    patch_weights_all = None
+    if isinstance(train_dataset, torch.utils.data.ConcatDataset):
+        pw_list = []
+        for ds in train_dataset.datasets:
+            if getattr(ds, "patch_weights", None) is not None:
+                pw_list.extend(ds.patch_weights)
+        if pw_list:
+            patch_weights_all = pw_list
+    elif getattr(train_dataset, "patch_weights", None) is not None:
+        patch_weights_all = train_dataset.patch_weights
+
+    if patch_weights_all is not None and not use_batch_sampler:
+        try:
+            weights = torch.as_tensor(patch_weights_all, dtype=torch.double)
+            weight_cap = float(getattr(opts.training, "sampler_weight_cap", 3.0))
+            if weight_cap > 0:
+                weights = torch.clamp(weights, max=weight_cap)
+            sampler = torch.utils.data.WeightedRandomSampler(
+                weights=weights, num_samples=len(weights), replacement=True
+            )
+            logging.info(
+                "Using WeightedRandomSampler with cap %.2f (min %.4f, max %.4f)",
+                weight_cap,
+                float(weights.min()),
+                float(weights.max()),
+            )
+        except Exception as exc:
+            logging.warning("Falling back to shuffle dataloader (sampler init failed): %s", exc)
+            sampler = None
+
+    if use_batch_sampler:
+        train_loader_kwargs = {
+            "batch_sampler": batches,
+            "num_workers": opts.data.num_workers,
+            "drop_last": False,
+            "pin_memory": getattr(opts.data, "pin_memory", False),
+        }
+    else:
+        train_loader_kwargs = {
+            "batch_size": opts.training.batch_size,
+            "shuffle": sampler is None,
+            "sampler": sampler,
+            "num_workers": opts.data.num_workers,
+            "drop_last": True,
+            "pin_memory": getattr(opts.data, "pin_memory", False),
+        }
     if train_loader_kwargs["num_workers"] and train_loader_kwargs["num_workers"] > 0:
         train_loader_kwargs["persistent_workers"] = True
         train_loader_kwargs["prefetch_factor"] = getattr(opts.data, "prefetch_factor", 2)
@@ -1068,7 +1184,8 @@ def main(config):
                 "batch_sampler": sampler_utils.slide_batch_sampler(
                     datasets,
                     opts.training.batch_size,
-                    shuffle_batches=False,
+                    opts.training,
+                    interleave=False,
                 ),
                 "drop_last": False,
                 "pin_memory": getattr(opts.data, "pin_memory", False),
