@@ -1399,9 +1399,10 @@ def main(config):
     batches = sampler_utils.slide_batch_sampler(
         train_datasets,
         opts.training.batch_size,
+        shuffle_batches=True,
     )
     logging.info(
-        "Using ordered slide batch sampler: slides=%d batch_size=%d",
+        "Using spatial slide batch sampler: slides=%d batch_size=%d shuffle_batches=True",
         len(train_datasets),
         int(opts.training.batch_size),
     )
@@ -1528,6 +1529,7 @@ def main(config):
                 "batch_sampler": sampler_utils.slide_batch_sampler(
                     datasets,
                     opts.training.batch_size,
+                    shuffle_batches=False,
                 ),
                 "drop_last": False,
                 "pin_memory": getattr(opts.data, "pin_memory", False),
