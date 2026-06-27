@@ -322,7 +322,7 @@ def preselect_tma_punch_with_vq(
         num_samples = max(int(getattr(opts.data, "punch_min_samples", 200)), num_samples)
         num_samples = min(int(getattr(opts.data, "punch_max_samples", 5000)), num_samples, int(pool_coords.shape[0]))
         num_samples = max(num_samples, 1)
-        seed = int(getattr(opts.training, "seed", 0))
+        seed = int(getattr(opts.training, "seed", getattr(opts.training, "batch_sampler_seed", 0)))
         rng = np.random.default_rng(seed + 10007 * max(slide_idx, 0))
         cand_idx = rng.choice(pool_coords.shape[0], size=num_samples, replace=pool_coords.shape[0] < num_samples)
         cand_centers = pool_coords[cand_idx]
@@ -1228,6 +1228,14 @@ def main(config):
         for line in gene_names:
             f.write(f"{line}\n")
 
+    if use_avgexp and hasattr(opts, "model"):
+        try:
+            if float(getattr(opts.model, "avgexp_residual_scale", 0.0)) <= 0.0:
+                setattr(opts.model, "avgexp_residual_scale", 0.1)
+                logging.info("Overriding model.avgexp_residual_scale=0.1 for imputation")
+        except Exception:
+            pass
+
     framework_name = f"{model_framework.Framework.__module__}.{model_framework.Framework.__name__}"
     try:
         model = model_framework.Framework(
@@ -1490,8 +1498,9 @@ def main(config):
                 pw_list.extend(ds.patch_weights)
         if pw_list:
             patch_weights_all = pw_list
-    elif getattr(train_dataset, "patch_weights", None) is not None:
-        patch_weights_all = train_dataset.patch_weights
+    else:
+        if getattr(train_dataset, "patch_weights", None) is not None:
+            patch_weights_all = train_dataset.patch_weights
 
     if patch_weights_all is not None and not use_batch_sampler:
         try:
@@ -1776,10 +1785,12 @@ def main(config):
     logits_loss_weight = float(getattr(opts.training, "logits_loss_weight", 1.0))
     logging.info(
         "Loss setup: pearson=%.3f expr_ct_embed_w=%.3f "
-        "logits_w=%.3f expr_ct_embed_internal=100",
+        "logits_w=%.3f expr_ct_embed_internal=100 "
+        "interleave_slide_batches=%s",
         pearson_loss_weight,
         expr_ct_embed_loss_weight,
         logits_loss_weight,
+        str(bool(getattr(opts.training, "interleave_slide_batches", True))),
     )
 
     def expr_loss_weighted(pred, target, mask=None):
@@ -2277,6 +2288,24 @@ def main(config):
             else:
                 loss_var_val = torch.tensor(0.0, device=device)
 
+            entropy_w = float(getattr(opts.training, "ref_entropy_weight", 0.0))
+            if entropy_w > 0:
+                aux = getattr(model, "last_aux_losses", {})
+                ent_base = aux.get("ref_weight_entropy")
+                ent_imm = aux.get("ref_weight_entropy_immune")
+                ent_inv = aux.get("ref_weight_entropy_invasive")
+                ent_terms = [
+                    x for x in (ent_base, ent_imm, ent_inv)
+                    if x is not None and torch.isfinite(x)
+                ]
+                if ent_terms:
+                    entropy_gain = torch.stack(ent_terms).mean()
+                    loss_entropy_val = -entropy_w * entropy_gain
+                else:
+                    loss_entropy_val = torch.tensor(0.0, device=device)
+            else:
+                loss_entropy_val = torch.tensor(0.0, device=device)
+
             aux_losses = getattr(model, "last_aux_losses", {})
             loss_vq_val = aux_losses.get(
                 "vq_patch", torch.tensor(0.0, device=device)
@@ -2296,6 +2325,7 @@ def main(config):
                 + loss_comp_gt_val
                 + pearson_weight_mult * loss_pearson_val
                 + loss_var_val
+                + loss_entropy_val
                 + loss_vq_val
             )
 
@@ -2490,18 +2520,31 @@ def main(config):
 
         primary_improved = val_gene_pooled_mean > (best_val_gene_pooled + best_metric_eps)
         primary_tied = abs(val_gene_pooled_mean - best_val_gene_pooled) <= best_metric_eps
-        if primary_improved or (
+        ct_constraint_ok = (
+            best_epoch is None
+            or val_ct_macro >= (best_val_ct_macro - best_metric_eps)
+        )
+        if (primary_improved and ct_constraint_ok) or (
             primary_tied and val_ct_macro > (best_val_ct_macro + best_metric_eps)
         ):
             best_val_gene_pooled = val_gene_pooled_mean
             best_val_ct_macro = val_ct_macro
             best_epoch = int(epoch + 1)
             best_ckpt_path = ckpt_model_path
+        elif primary_improved and not ct_constraint_ok:
+            logging.info(
+                "Best-checkpoint update rejected at epoch %d: pooled_gene_pearson %.6f > %.6f but ct_macro %.6f < %.6f",
+                epoch + 1,
+                val_gene_pooled_mean,
+                best_val_gene_pooled,
+                val_ct_macro,
+                best_val_ct_macro,
+            )
 
     # Best-checkpoint summary
     strict_best = {
         "selection_metric": "pearson_gene_pooled_mean",
-        "selection_constraint": "none_ct_macro_reported_only",
+        "selection_constraint": "non_decreasing_ct_accuracy_macro",
         "best_epoch": int(best_epoch) if best_epoch is not None else None,
         "best_val_pearson_gene_pooled_mean": (
             float(best_val_gene_pooled) if np.isfinite(best_val_gene_pooled) else None

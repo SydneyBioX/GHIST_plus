@@ -7,10 +7,10 @@ import numpy as np
 
 class _InterleavedSlideBatchSampler:
     """
-    Keep each batch slide-pure while interleaving slide batches across an epoch.
+    Keep each batch slide-pure while interleaving slide batches across the epoch.
 
-    This preserves per-slide avgexp assumptions while avoiding long same-slide
-    blocks when multiple slides are trained together.
+    This preserves the per-slide avgexp assumption used later in training while
+    preventing AdamW from seeing long same-slide blocks.
     """
 
     def __init__(
@@ -38,8 +38,7 @@ class _InterleavedSlideBatchSampler:
             self.lengths.append(length)
             acc += length
         self.total_batches = sum(
-            (length + self.batch_size - 1) // self.batch_size
-            for length in self.lengths
+            (length + self.batch_size - 1) // self.batch_size for length in self.lengths
         )
         self._epoch_index = 0
 
@@ -115,7 +114,7 @@ class _InterleavedSlideBatchSampler:
             active = next_active
 
 
-def slide_batch_sampler(datasets, batch_size, training_cfg=None, interleave=False):
+def slide_batch_sampler(datasets, batch_size, training_cfg, interleave=False):
     sampler_seed = int(getattr(training_cfg, "batch_sampler_seed", 0))
     shuffle_within_slide = bool(
         getattr(training_cfg, "shuffle_within_slide_batches", True)
@@ -129,9 +128,9 @@ def slide_batch_sampler(datasets, batch_size, training_cfg=None, interleave=Fals
     acc = 0
     for ds in datasets:
         offsets.append(acc)
-        length = len(ds)
-        lengths.append(length)
-        acc += length
+        l = len(ds)
+        lengths.append(l)
+        acc += l
     if interleave:
         logging.info(
             "Using interleaved slide batch sampler: seed=%d shuffle_within_slide=%s weighted=%s",
@@ -141,7 +140,9 @@ def slide_batch_sampler(datasets, batch_size, training_cfg=None, interleave=Fals
         )
         slide_weights = None
         if weighted_interleave:
-            slide_weights = [getattr(ds, "patch_weights", None) for ds in datasets]
+            slide_weights = []
+            for ds in datasets:
+                slide_weights.append(getattr(ds, "patch_weights", None))
         return _InterleavedSlideBatchSampler(
             datasets,
             batch_size,
@@ -151,10 +152,9 @@ def slide_batch_sampler(datasets, batch_size, training_cfg=None, interleave=Fals
             slide_weights=slide_weights,
             weight_cap=weight_cap,
         )
-
     batches = []
-    for offset, length in zip(offsets, lengths):
-        idxs = list(range(offset, offset + length))
-        for i in range(0, length, batch_size):
+    for off, l in zip(offsets, lengths):
+        idxs = list(range(off, off + l))
+        for i in range(0, l, batch_size):
             batches.append(idxs[i : i + batch_size])
     return batches

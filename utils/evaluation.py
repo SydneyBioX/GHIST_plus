@@ -198,6 +198,7 @@ def evaluate_validation(
                 # Keep one debug line without any per-cell Pearson metrics (too noisy for logs).
                 aux = getattr(model, "last_aux_losses", {}) if hasattr(model, "last_aux_losses") else {}
                 ref_base = aux.get("expr_ref_base")
+                ref_gate = aux.get("expr_ref_gate")
                 ref_stats = ""
                 if ref_base is not None and isinstance(ref_base, torch.Tensor) and ref_base.numel() > 0:
                     ref_stats = (
@@ -209,13 +210,17 @@ def evaluate_validation(
                             ref_base.max().item(),
                         )
                     )
+                gate_stats = ""
+                if ref_gate is not None and isinstance(ref_gate, torch.Tensor) and ref_gate.numel() > 0:
+                    gate_stats = " | expr_ref_gate=%.4f" % ref_gate.detach().float().mean().item()
                 zero_frac = (
                     (out_expr <= 0).float().mean().item() if out_expr.numel() > 0 else 0.0
                 )
                 logging.info(
-                    "Validation diagnostics: zero_frac=%.4f%s",
+                    "Validation diagnostics: zero_frac=%.4f%s%s",
                     zero_frac,
                     ref_stats,
+                    gate_stats,
                 )
                 log_debug_once = False
 

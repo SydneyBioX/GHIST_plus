@@ -53,6 +53,7 @@
     "model": {
         "emb_dim": 1024,
         "avgexp_temp": 1.0,
+        "avgexp_residual_scale": 1.0,
         "ct_prior_blend_alpha": 1.0,
         "refiner_query_tokens": 8,
         "ecrm": {
@@ -70,7 +71,9 @@
             "cross_patch": true,
             "edge_dropout": 0.05,
             "message_dropout": 0.05,
-            "residual_gate_init": -1.4
+            "residual_gate_init": -1.4,
+            "apply_to_ref_weights": false,
+            "apply_to_expr_residual": true
         },
         "vq_patch": {
             "enabled": true,
@@ -94,8 +97,14 @@
         "expr_ct_embed_loss_weight": 1.0,
         "logits_loss_weight": 1.0,
         "expr_var_penalty_weight": 0.0,
+        "ref_entropy_weight": 0,
+        "immune_sampler_boost": 1.5,
         "use_expr_baseline": false,
         "holdout_n_genes": 0,
+        "interleave_slide_batches": true,
+        "weighted_interleave_slide_batches": true,
+        "shuffle_within_slide_batches": true,
+        "batch_sampler_seed": 20260419,
         "panel_use_natural_missing": false
     },
     "evaluation": {

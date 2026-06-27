@@ -273,6 +273,10 @@ class Framework(nn.Module):
         if self.use_ecrm:
             self.ecrm = EdgeCondMixer(self.hidden_size, k=int(getattr(ecrm_cfg, "k_target", 16)))
             self.ecrm_apply_to_embeddings = bool(getattr(ecrm_cfg, "apply_to_embeddings", True))
+            self.ecrm_apply_to_ref_weights = bool(getattr(ecrm_cfg, "apply_to_ref_weights", False))
+            self.ecrm_apply_to_expr_residual = bool(getattr(ecrm_cfg, "apply_to_expr_residual", False))
+            self.ecrm_ref_weights_alpha = float(getattr(ecrm_cfg, "ref_weights_alpha", 1.0))
+            self.ecrm_expr_residual_alpha = float(getattr(ecrm_cfg, "expr_residual_alpha", 1.0))
             self.ecrm_use_gt_ct = bool(getattr(ecrm_cfg, "use_gt_ct", False))
             self.ecrm_gate_h_from_embeddings = bool(
                 getattr(ecrm_cfg, "gate_h_from_embeddings", False)
@@ -318,6 +322,10 @@ class Framework(nn.Module):
         else:
             self.ecrm = None
             self.ecrm_apply_to_embeddings = False
+            self.ecrm_apply_to_ref_weights = False
+            self.ecrm_apply_to_expr_residual = False
+            self.ecrm_ref_weights_alpha = 0.0
+            self.ecrm_expr_residual_alpha = 0.0
             self.ecrm_use_gt_ct = False
             self.ecrm_gate_h_from_embeddings = False
         # Small projection of embeddings for ECRM expression similarity
@@ -750,6 +758,9 @@ class Framework(nn.Module):
             )
 
         # --- Expression heads ------------------------------------------------
+        ref_weight_entropy = None
+        ref_weight_entropy_immune = None
+        ref_weight_entropy_invasive = None
         expr_ref_gate = None
         expr_ref_gate_immune = None
         expr_ref_gate_invasive = None
@@ -761,10 +772,15 @@ class Framework(nn.Module):
             ref_weights = self._resolve_ref_weights(
                 self.mlp_weights(embeddings), ct_prob_pred, ct_labels
             )
+            if ref_weights.numel() > 0 and ref_weights.shape[1] > 1:
+                ref_weight_entropy = -(
+                    ref_weights.clamp_min(1e-8) * ref_weights.clamp_min(1e-8).log()
+                ).sum(dim=1).mean() / math.log(ref_weights.shape[1])
 
             if (
                 self.use_ecrm
                 and self.ecrm is not None
+                and self.ecrm_apply_to_ref_weights
                 and coords_all.size(0) > 1
                 and ref_weights.numel() > 0
             ):
@@ -784,7 +800,9 @@ class Framework(nn.Module):
                     edge_index=edge_index_cells,
                     patch_ids=patch_assign,
                 )
-                ref_weights = ref_weights_mixed
+                alpha = float(self.ecrm_ref_weights_alpha)
+                alpha = max(0.0, min(1.0, alpha))
+                ref_weights = ref_weights + alpha * (ref_weights_mixed - ref_weights)
                 ref_weights = ref_weights.clamp_min(0.0)
                 ref_weights = ref_weights / ref_weights.sum(dim=1, keepdim=True).clamp_min(1e-6)
             ref_weighted = torch.sum(ref_weights.unsqueeze(-1) * ref, dim=1)
@@ -803,6 +821,7 @@ class Framework(nn.Module):
             if (
                 self.use_ecrm
                 and self.ecrm is not None
+                and self.ecrm_apply_to_expr_residual
                 and coords_all.size(0) > 1
                 and expr_direct.numel() > 0
             ):
@@ -822,7 +841,9 @@ class Framework(nn.Module):
                     edge_index=edge_index_cells,
                     patch_ids=patch_assign,
                 )
-                expr_direct = expr_direct_mixed
+                alpha = float(self.ecrm_expr_residual_alpha)
+                alpha = max(0.0, min(1.0, alpha))
+                expr_direct = expr_direct + alpha * (expr_direct_mixed - expr_direct)
 
             out_expr, expr_ref_gate, _ = self._fuse_direct_with_ref(
                 expr_direct,
@@ -835,6 +856,11 @@ class Framework(nn.Module):
             ref_weights_immune = self._resolve_ref_weights(
                 self.mlp_weights_immune(embeddings), ct_prob_pred, ct_labels
             )
+            if ref_weights_immune.numel() > 0 and ref_weights_immune.shape[1] > 1:
+                ref_weight_entropy_immune = -(
+                    ref_weights_immune.clamp_min(1e-8)
+                    * ref_weights_immune.clamp_min(1e-8).log()
+                ).sum(dim=1).mean() / math.log(ref_weights_immune.shape[1])
             ref_immune = torch.sum(ref_weights_immune.unsqueeze(-1) * ref, dim=1)
             ref_offsets_immune = None
             if self.use_crossattn and comp_tiled_all is not None:
@@ -860,6 +886,11 @@ class Framework(nn.Module):
             ref_weights_invasive = self._resolve_ref_weights(
                 self.mlp_weights_invasive(embeddings), ct_prob_pred, ct_labels
             )
+            if ref_weights_invasive.numel() > 0 and ref_weights_invasive.shape[1] > 1:
+                ref_weight_entropy_invasive = -(
+                    ref_weights_invasive.clamp_min(1e-8)
+                    * ref_weights_invasive.clamp_min(1e-8).log()
+                ).sum(dim=1).mean() / math.log(ref_weights_invasive.shape[1])
             ref_invasive = torch.sum(ref_weights_invasive.unsqueeze(-1) * ref, dim=1)
             ref_offsets_invasive = None
             if self.use_crossattn and comp_tiled_all is not None:
@@ -992,6 +1023,9 @@ class Framework(nn.Module):
             "expr_ref_base": ref_weighted if self.use_avgexp and ref_orig is not None else None,
             "expr_ref_base_immune": ref_immune if self.use_avgexp and ref_orig is not None else None,
             "expr_ref_base_invasive": ref_invasive if self.use_avgexp and ref_orig is not None else None,
+            "ref_weight_entropy": ref_weight_entropy,
+            "ref_weight_entropy_immune": ref_weight_entropy_immune,
+            "ref_weight_entropy_invasive": ref_weight_entropy_invasive,
             "expr_ref_gate": expr_ref_gate,
             "expr_ref_gate_immune": expr_ref_gate_immune,
             "expr_ref_gate_invasive": expr_ref_gate_invasive,

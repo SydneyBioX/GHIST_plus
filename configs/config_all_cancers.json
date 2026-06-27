@@ -45,6 +45,7 @@
     "model": {
         "emb_dim": 1024,
         "avgexp_temp": 1.0,
+        "avgexp_residual_scale": 0,
         "refiner_query_tokens": 8,
         "ecrm": {
             "k_target": 12,
@@ -61,7 +62,9 @@
             "cross_patch": true,
             "edge_dropout": 0.05,
             "message_dropout": 0.05,
-            "residual_gate_init": -1.4
+            "residual_gate_init": -1.4,
+            "apply_to_ref_weights": true,
+            "apply_to_expr_residual": true
         },
         "vq_patch": {
             "enabled": true,
@@ -83,6 +86,8 @@
         "stain_aug": true,
         "pearson_loss_weight": 0.25,
         "expr_var_penalty_weight": 0.05,
+        "ref_entropy_weight": 0,
+        "immune_sampler_boost": 1.5,
         "use_expr_baseline": false,
         "holdout_n_genes": 0
     },
