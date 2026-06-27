@@ -140,18 +140,35 @@ def pearson_loss(pred, target, eps=1e-6):
 
 def masked_pearson(pred, target, mask=None, eps=1e-6):
     """
-    Pearson distance (1 - corr) with an optional per-gene mask.
+    Per-gene Pearson distance (1 - corr) across cells with an optional
+    cell-by-gene observation mask. This matches validation GenePCC.
     """
     if mask is None:
         return pearson_loss(pred, target, eps=eps)
     mask = mask.float()
-    valid = mask.sum(dim=1, keepdim=True).clamp_min(1.0)
-    pred_center = (pred * mask - (pred * mask).sum(dim=1, keepdim=True) / valid)
-    targ_center = (target * mask - (target * mask).sum(dim=1, keepdim=True) / valid)
-    num = (pred_center * targ_center * mask).sum(dim=1)
+    valid = mask.sum(dim=0)
+    keep = valid > 1.0
+    if not keep.any():
+        return pred.new_tensor(0.0)
+
+    pred = pred[:, keep]
+    target = target[:, keep]
+    mask = mask[:, keep]
+    valid = valid[keep].clamp_min(1.0).view(1, -1)
+
+    pred_mean = (pred * mask).sum(dim=0, keepdim=True) / valid
+    targ_mean = (target * mask).sum(dim=0, keepdim=True) / valid
+    pred_center = (pred - pred_mean) * mask
+    targ_center = (target - targ_mean) * mask
+
+    num = (pred_center * targ_center).sum(dim=0)
+    targ_ss = (targ_center**2).sum(dim=0)
+    keep_var = targ_ss > eps
+    if not keep_var.any():
+        return pred.new_tensor(0.0)
     denom = (
-        ((pred_center**2) * mask).sum(dim=1).clamp_min(eps).sqrt()
-        * ((targ_center**2) * mask).sum(dim=1).clamp_min(eps).sqrt()
+        (pred_center**2).sum(dim=0).clamp_min(eps).sqrt()
+        * targ_ss.clamp_min(eps).sqrt()
     ).clamp_min(eps)
-    corr = num / denom
+    corr = num[keep_var] / denom[keep_var]
     return (1.0 - corr).mean()

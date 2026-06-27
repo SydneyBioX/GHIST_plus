@@ -2490,31 +2490,18 @@ def main(config):
 
         primary_improved = val_gene_pooled_mean > (best_val_gene_pooled + best_metric_eps)
         primary_tied = abs(val_gene_pooled_mean - best_val_gene_pooled) <= best_metric_eps
-        ct_constraint_ok = (
-            best_epoch is None
-            or val_ct_macro >= (best_val_ct_macro - best_metric_eps)
-        )
-        if (primary_improved and ct_constraint_ok) or (
+        if primary_improved or (
             primary_tied and val_ct_macro > (best_val_ct_macro + best_metric_eps)
         ):
             best_val_gene_pooled = val_gene_pooled_mean
             best_val_ct_macro = val_ct_macro
             best_epoch = int(epoch + 1)
             best_ckpt_path = ckpt_model_path
-        elif primary_improved and not ct_constraint_ok:
-            logging.info(
-                "Best-checkpoint update rejected at epoch %d: pooled_gene_pearson %.6f > %.6f but ct_macro %.6f < %.6f",
-                epoch + 1,
-                val_gene_pooled_mean,
-                best_val_gene_pooled,
-                val_ct_macro,
-                best_val_ct_macro,
-            )
 
     # Best-checkpoint summary
     strict_best = {
         "selection_metric": "pearson_gene_pooled_mean",
-        "selection_constraint": "non_decreasing_ct_accuracy_macro",
+        "selection_constraint": "none_ct_macro_reported_only",
         "best_epoch": int(best_epoch) if best_epoch is not None else None,
         "best_val_pearson_gene_pooled_mean": (
             float(best_val_gene_pooled) if np.isfinite(best_val_gene_pooled) else None

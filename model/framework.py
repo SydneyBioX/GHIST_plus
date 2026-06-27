@@ -37,6 +37,15 @@ def _to_namespace(obj):
     return obj
 
 
+def _zero_last_linear(module):
+    for layer in reversed(list(module.modules())):
+        if isinstance(layer, nn.Linear):
+            nn.init.zeros_(layer.weight)
+            if layer.bias is not None:
+                nn.init.zeros_(layer.bias)
+            return
+
+
 class Framework(nn.Module):
     """
     Drop-in replacement for the legacy Framework that now:
@@ -195,6 +204,12 @@ class Framework(nn.Module):
                 self.mlp_avgexp_residual = MLP(self.hidden_size, self.hidden_size, n_genes)
                 self.mlp_avgexp_residual_immune = MLP(self.hidden_size, self.hidden_size, n_genes)
                 self.mlp_avgexp_residual_invasive = MLP(self.hidden_size, self.hidden_size, n_genes)
+                for residual_head in (
+                    self.mlp_avgexp_residual,
+                    self.mlp_avgexp_residual_immune,
+                    self.mlp_avgexp_residual_invasive,
+                ):
+                    _zero_last_linear(residual_head)
         else:
             self.mlp_offset = MLP(self.hidden_size, self.hidden_size, n_genes)
             self.mlp_offset_immune = MLP(
