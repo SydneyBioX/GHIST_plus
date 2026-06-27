@@ -45,7 +45,6 @@
     "model": {
         "emb_dim": 1024,
         "avgexp_temp": 1.0,
-        "avgexp_residual_scale": 0,
         "refiner_query_tokens": 8,
         "ecrm": {
             "k_target": 12,

@@ -4,7 +4,6 @@ This module wires the image encoder, cell-type heads, ECRM neighbourhood
 mixers, VQ tile prototypes, expression heads, and panel-completion branch.
 """
 
-import math
 from types import SimpleNamespace
 
 import torch
@@ -97,8 +96,11 @@ class Framework(nn.Module):
         self.use_avgexp_residual = bool(
             getattr(model_cfg, "use_avgexp_residual", True)
         ) and self.use_celltype_priors
-        self.avgexp_residual_scale = float(
-            getattr(model_cfg, "avgexp_residual_scale", 0.1)
+        avgexp_residual_scale = float(
+            getattr(model_cfg, "avgexp_residual_scale", 1.0)
+        )
+        self.avgexp_residual_scale = (
+            avgexp_residual_scale if avgexp_residual_scale > 0.0 else 1.0
         )
         self.ct_prior_blend_alpha = float(
             getattr(model_cfg, "ct_prior_blend_alpha", 1.0)
@@ -210,13 +212,6 @@ class Framework(nn.Module):
         else:
             self.estimate_comp = None
 
-        def _gate_param(init=0.1, gate_max=1.0):
-            init = float(init)
-            gate_max = float(gate_max)
-            init = min(max(init, 1e-6), max(gate_max - 1e-6, 1e-6))
-            raw = math.log(init / max(gate_max - init, 1e-8))
-            return nn.Parameter(torch.tensor(raw)), gate_max
-
         if self.use_crossattn and n_classes > 0:
             refiner_cls = CompExprRefinerMTA if self.refiner_type == "mta" else CrossAttention
             refiner_kwargs = {}
@@ -233,40 +228,10 @@ class Framework(nn.Module):
             self.refine_expr_invasive = refiner_cls(
                 n_classes, n_genes, self.hidden_size, num_heads=8, **refiner_kwargs
             )
-            # Small gate to ramp cross-attn contribution; initialized low for stability
-            self.cross_gate_raw, self.cross_gate_max = _gate_param()
-            self.cross_gate_immune_raw, self.cross_gate_immune_max = _gate_param()
-            self.cross_gate_invasive_raw, self.cross_gate_invasive_max = _gate_param()
         else:
             self.refine_expr = None
             self.refine_expr_immune = None
             self.refine_expr_invasive = None
-            self.cross_gate_raw = None
-            self.cross_gate_max = None
-            self.cross_gate_immune_raw = None
-            self.cross_gate_immune_max = None
-            self.cross_gate_invasive_raw = None
-            self.cross_gate_invasive_max = None
-
-        expr_ref_gate_init = float(getattr(model_cfg, "expr_ref_gate_init", 0.1))
-        expr_ref_gate_max = float(getattr(model_cfg, "expr_ref_gate_max", 0.5))
-        if self.use_avgexp:
-            self.expr_ref_gate_raw, self.expr_ref_gate_max = _gate_param(
-                expr_ref_gate_init, expr_ref_gate_max
-            )
-            self.expr_ref_gate_immune_raw, self.expr_ref_gate_immune_max = _gate_param(
-                expr_ref_gate_init, expr_ref_gate_max
-            )
-            self.expr_ref_gate_invasive_raw, self.expr_ref_gate_invasive_max = _gate_param(
-                expr_ref_gate_init, expr_ref_gate_max
-            )
-        else:
-            self.expr_ref_gate_raw = None
-            self.expr_ref_gate_max = None
-            self.expr_ref_gate_immune_raw = None
-            self.expr_ref_gate_immune_max = None
-            self.expr_ref_gate_invasive_raw = None
-            self.expr_ref_gate_invasive_max = None
 
         ecrm_cfg = _to_namespace(getattr(model_cfg, "ecrm", None))
         self.use_ecrm = self.use_neighb and bool(getattr(ecrm_cfg, "enabled", True))
@@ -380,18 +345,12 @@ class Framework(nn.Module):
         mixed = (1.0 - alpha) * learned + alpha * prior
         return mixed / mixed.sum(dim=1, keepdim=True).clamp_min(1e-6)
 
-    def _fuse_direct_with_ref(self, expr_direct, ref_base, ref_offsets, gate_raw, gate_max):
+    def _fuse_direct_with_ref(self, expr_direct, ref_base, ref_offsets):
         ref_corr = ref_base if ref_offsets is None else (ref_base + ref_offsets)
-        if gate_raw is None or gate_max is None:
-            gate = ref_corr.new_tensor(1.0)
-        else:
-            gate = torch.sigmoid(gate_raw).to(
-                device=ref_corr.device, dtype=ref_corr.dtype
-            ) * float(gate_max)
-        out_expr = expr_direct + gate * ref_corr
+        out_expr = expr_direct + ref_corr
         if self.expr_relu:
             out_expr = self.relu(out_expr)
-        return out_expr, gate, ref_corr
+        return out_expr
 
     def _freeze_encoder(self, trainable_blocks: int = 0):
         for p in self.cnn.parameters():
@@ -750,9 +709,6 @@ class Framework(nn.Module):
             )
 
         # --- Expression heads ------------------------------------------------
-        expr_ref_gate = None
-        expr_ref_gate_immune = None
-        expr_ref_gate_invasive = None
         if self.use_avgexp:
             # assume reference provided when avgexp is enabled
             ref = ref_orig.unsqueeze(0).to(device)
@@ -791,8 +747,6 @@ class Framework(nn.Module):
             ref_offsets = None
             if self.use_crossattn and comp_tiled_all is not None:
                 ref_offsets = self.refine_expr(comp_tiled_all, ref_weighted)
-                cross_gate = torch.sigmoid(self.cross_gate_raw) * self.cross_gate_max
-                ref_offsets = ref_offsets * cross_gate
             if self.use_avgexp_residual and hasattr(self, "mlp_avgexp_residual"):
                 ref_residual, _ = self.mlp_avgexp_residual(embeddings)
                 expr_direct = self.avgexp_residual_scale * ref_residual
@@ -824,12 +778,10 @@ class Framework(nn.Module):
                 )
                 expr_direct = expr_direct_mixed
 
-            out_expr, expr_ref_gate, _ = self._fuse_direct_with_ref(
+            out_expr = self._fuse_direct_with_ref(
                 expr_direct,
                 ref_weighted,
                 ref_offsets,
-                self.expr_ref_gate_raw,
-                self.expr_ref_gate_max,
             )
 
             ref_weights_immune = self._resolve_ref_weights(
@@ -841,20 +793,16 @@ class Framework(nn.Module):
                 ref_offsets_immune = self.refine_expr_immune(
                     comp_tiled_all, ref_immune
                 )
-                gate_immune = torch.sigmoid(self.cross_gate_immune_raw) * self.cross_gate_immune_max
-                ref_offsets_immune = ref_offsets_immune * gate_immune
             if self.use_avgexp_residual and hasattr(self, "mlp_avgexp_residual_immune"):
                 ref_residual_immune, _ = self.mlp_avgexp_residual_immune(embeddings)
                 expr_direct_immune = self.avgexp_residual_scale * ref_residual_immune
             else:
                 expr_direct_immune = torch.zeros_like(ref_immune)
             torch.nan_to_num_(expr_direct_immune, nan=0.0, posinf=0.0, neginf=0.0)
-            out_expr_immune, expr_ref_gate_immune, _ = self._fuse_direct_with_ref(
+            out_expr_immune = self._fuse_direct_with_ref(
                 expr_direct_immune,
                 ref_immune,
                 ref_offsets_immune,
-                self.expr_ref_gate_immune_raw,
-                self.expr_ref_gate_immune_max,
             )
 
             ref_weights_invasive = self._resolve_ref_weights(
@@ -866,20 +814,16 @@ class Framework(nn.Module):
                 ref_offsets_invasive = self.refine_expr_invasive(
                     comp_tiled_all, ref_invasive
                 )
-                gate_invasive = torch.sigmoid(self.cross_gate_invasive_raw) * self.cross_gate_invasive_max
-                ref_offsets_invasive = ref_offsets_invasive * gate_invasive
             if self.use_avgexp_residual and hasattr(self, "mlp_avgexp_residual_invasive"):
                 ref_residual_inv, _ = self.mlp_avgexp_residual_invasive(embeddings)
                 expr_direct_invasive = self.avgexp_residual_scale * ref_residual_inv
             else:
                 expr_direct_invasive = torch.zeros_like(ref_invasive)
             torch.nan_to_num_(expr_direct_invasive, nan=0.0, posinf=0.0, neginf=0.0)
-            out_expr_invasive, expr_ref_gate_invasive, _ = self._fuse_direct_with_ref(
+            out_expr_invasive = self._fuse_direct_with_ref(
                 expr_direct_invasive,
                 ref_invasive,
                 ref_offsets_invasive,
-                self.expr_ref_gate_invasive_raw,
-                self.expr_ref_gate_invasive_max,
             )
         else:
             ref_offsets, _ = self.mlp_offset(embeddings)
@@ -992,9 +936,6 @@ class Framework(nn.Module):
             "expr_ref_base": ref_weighted if self.use_avgexp and ref_orig is not None else None,
             "expr_ref_base_immune": ref_immune if self.use_avgexp and ref_orig is not None else None,
             "expr_ref_base_invasive": ref_invasive if self.use_avgexp and ref_orig is not None else None,
-            "expr_ref_gate": expr_ref_gate,
-            "expr_ref_gate_immune": expr_ref_gate_immune,
-            "expr_ref_gate_invasive": expr_ref_gate_invasive,
         }
 
         return (

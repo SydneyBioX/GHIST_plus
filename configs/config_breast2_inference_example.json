@@ -53,7 +53,6 @@
     "model": {
         "emb_dim": 1024,
         "avgexp_temp": 1.0,
-        "avgexp_residual_scale": 1.0,
         "ct_prior_blend_alpha": 1.0,
         "refiner_query_tokens": 8,
         "ecrm": {

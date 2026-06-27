@@ -802,14 +802,6 @@ def main(config):
         for line in gene_names:
             f.write(f"{line}\n")
 
-    if use_avgexp and hasattr(opts, "model"):
-        try:
-            if float(getattr(opts.model, "avgexp_residual_scale", 0.0)) <= 0.0:
-                setattr(opts.model, "avgexp_residual_scale", 0.1)
-                logging.info("Overriding model.avgexp_residual_scale=0.1 for imputation")
-        except Exception:
-            pass
-
     framework_name = f"{model_framework.Framework.__module__}.{model_framework.Framework.__name__}"
     try:
         model = model_framework.Framework(

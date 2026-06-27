@@ -491,6 +491,13 @@ def main():
 
     _log(f"[INFO] checkpoint selected={checkpoint_fp}")
     sd = state.get("model_state_dict", state)
+    obsolete_gate_parts = ("cross_gate_", "expr_ref_gate_")
+    obsolete_keys = [
+        k for k in sd.keys() if any(part in k for part in obsolete_gate_parts)
+    ]
+    if obsolete_keys:
+        sd = {k: v for k, v in sd.items() if k not in obsolete_keys}
+        _log(f"[INFO] dropped {len(obsolete_keys)} obsolete full-strength gate key(s)")
     missing, unexpected = model.load_state_dict(sd, strict=False)
     _log(f"[INFO] state_dict loaded: missing={len(missing)} unexpected={len(unexpected)}")
     if missing or unexpected:
