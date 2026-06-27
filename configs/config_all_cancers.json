@@ -83,7 +83,6 @@
         "stain_aug": true,
         "pearson_loss_weight": 0.25,
         "expr_var_penalty_weight": 0.05,
-        "immune_sampler_boost": 1.5,
         "use_expr_baseline": false,
         "holdout_n_genes": 0
     },
