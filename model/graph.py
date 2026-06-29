@@ -41,19 +41,38 @@ def _build_knn_graph(coords: torch.Tensor, patch_index: torch.Tensor, k: int) ->
     return torch.zeros((2, 0), dtype=torch.long, device=device)
 
 
-def _build_knn_graph_global(coords: torch.Tensor, k: int) -> torch.Tensor:
-    if coords.numel() == 0:
+def _build_knn_graph_cross_patch(
+    coords: torch.Tensor,
+    patch_index: torch.Tensor,
+    global_mask: torch.Tensor,
+    k: int,
+    radius: float | None = None,
+) -> torch.Tensor:
+    if coords.numel() == 0 or patch_index.numel() == 0 or global_mask.numel() == 0:
         return torch.zeros((2, 0), dtype=torch.long, device=coords.device)
-    n = int(coords.shape[0])
+    idx = torch.where(global_mask.to(device=coords.device, dtype=torch.bool))[0]
+    n = int(idx.numel())
     if n <= 1:
         return torch.zeros((2, 0), dtype=torch.long, device=coords.device)
-    dist = torch.cdist(coords, coords, p=2)
+
+    coords_g = coords[idx]
+    patch_g = patch_index[idx]
+    dist = torch.cdist(coords_g, coords_g, p=2)
     dist.fill_diagonal_(float("inf"))
+    same_patch = patch_g.view(-1, 1) == patch_g.view(1, -1)
+    dist = dist.masked_fill(same_patch, float("inf"))
+    if radius is not None and float(radius) > 0:
+        dist = dist.masked_fill(dist > float(radius), float("inf"))
+
     k_eff = min(max(int(k), 1), n - 1)
-    nbr = dist.topk(k_eff, largest=False).indices
-    src = torch.arange(n, device=coords.device).unsqueeze(1).expand(-1, k_eff)
-    dst = nbr
-    return torch.stack([src.reshape(-1), dst.reshape(-1)], dim=0)
+    nbr_local = dist.topk(k_eff, largest=False).indices
+    nbr_dist = dist.gather(1, nbr_local)
+    valid = torch.isfinite(nbr_dist)
+    if not valid.any():
+        return torch.zeros((2, 0), dtype=torch.long, device=coords.device)
+    src = idx.view(-1, 1).expand(-1, k_eff)[valid]
+    dst = idx[nbr_local[valid]]
+    return torch.stack([src, dst], dim=0)
 
 
 def _coalesce_edges(edge_index: torch.Tensor, n_nodes: int) -> torch.Tensor:
@@ -83,6 +102,7 @@ def build_cell_graph(
     cell_coord_map: dict | None = None,
     cross_patch: bool = False,
     cross_patch_k: int | None = None,
+    cross_patch_radius: float | None = None,
 ) -> CellGraph:
     """
     Construct per-cell centroids and an intra-patch kNN graph so ECRM can mix
@@ -91,8 +111,10 @@ def build_cell_graph(
     """
     device = nuclei_batch.device
     B, H, W = nuclei_batch.shape
-    coords_list = []
+    coords_local_list = []
+    coords_global_list = []
     patch_assign_list = []
+    global_coord_list = []
     cells_per_patch = []
     coords_batch_valid_global = (
         isinstance(coords_batch, torch.Tensor)
@@ -101,7 +123,6 @@ def build_cell_graph(
         and coords_batch.shape[2] >= 2
     )
     has_coord_map = isinstance(cell_coord_map, dict) and len(cell_coord_map) > 0
-    has_global_coords = coords_batch_valid_global or has_coord_map
 
     yy = torch.arange(H, device=device, dtype=torch.float32).view(H, 1).expand(H, W)
     xx = torch.arange(W, device=device, dtype=torch.float32).view(1, W).expand(H, W)
@@ -123,44 +144,65 @@ def build_cell_graph(
             if area.item() == 0:
                 continue
             cid_int = int(cid.item())
+            c_mask_f = c_mask.float()
+            area_f = area.float()
+            cy_local = (c_mask_f * yy).sum() / area_f
+            cx_local = (c_mask_f * xx).sum() / area_f
+            cy_local = (cy_local / max(H - 1, 1)) * 2 - 1
+            cx_local = (cx_local / max(W - 1, 1)) * 2 - 1
             if has_coord_map and cid_int in cell_coord_map:
                 cyx = cell_coord_map[cid_int]
-                cy = torch.tensor(float(cyx[0]), dtype=torch.float32, device=device)
-                cx = torch.tensor(float(cyx[1]), dtype=torch.float32, device=device)
+                cy_global = torch.tensor(float(cyx[0]), dtype=torch.float32, device=device)
+                cx_global = torch.tensor(float(cyx[1]), dtype=torch.float32, device=device)
+                has_global_coord = True
             elif coords_batch_valid_global:
                 if local_rank < coords_batch.shape[1]:
                     cxy = coords_batch[b, local_rank, :2].float().to(device)
-                    cy = cxy[1]
-                    cx = cxy[0]
+                    cy_global = cxy[1]
+                    cx_global = cxy[0]
+                    has_global_coord = True
                 else:
-                    c_mask = c_mask.float()
-                    area = area.float()
-                    cy = (c_mask * yy).sum() / area
-                    cx = (c_mask * xx).sum() / area
-                    cy = (cy / max(H - 1, 1)) * 2 - 1
-                    cx = (cx / max(W - 1, 1)) * 2 - 1
+                    cy_global = cy_local
+                    cx_global = cx_local
+                    has_global_coord = False
             else:
-                c_mask = c_mask.float()
-                area = area.float()
-                cy = (c_mask * yy).sum() / area
-                cx = (c_mask * xx).sum() / area
-                cy = (cy / max(H - 1, 1)) * 2 - 1
-                cx = (cx / max(W - 1, 1)) * 2 - 1
-            coords_list.append(torch.stack([cy, cx]))
+                cy_global = cy_local
+                cx_global = cx_local
+                has_global_coord = False
+            coords_local_list.append(torch.stack([cy_local, cx_local]))
+            coords_global_list.append(torch.stack([cy_global, cx_global]))
             patch_assign_list.append(torch.tensor(b, dtype=torch.long, device=device))
+            global_coord_list.append(torch.tensor(has_global_coord, dtype=torch.bool, device=device))
             local_rank += 1
 
-    if coords_list:
-        coords = torch.stack(coords_list, dim=0)
+    if coords_local_list:
+        coords_local = torch.stack(coords_local_list, dim=0)
+        coords_global = torch.stack(coords_global_list, dim=0)
         patch_index = torch.stack(patch_assign_list, dim=0)
+        global_mask = torch.stack(global_coord_list, dim=0)
     else:
-        coords = torch.zeros((0, 2), device=device)
+        coords_local = torch.zeros((0, 2), device=device)
+        coords_global = torch.zeros((0, 2), device=device)
         patch_index = torch.zeros((0,), dtype=torch.long, device=device)
+        global_mask = torch.zeros((0,), dtype=torch.bool, device=device)
 
+    use_global_graph = (
+        bool(cross_patch)
+        and coords_global.shape[0] > 1
+        and bool(global_mask.numel() > 0)
+        and bool(global_mask.all().item())
+    )
+    coords = coords_global if use_global_graph else coords_local
     edge_index = _build_knn_graph(coords, patch_index, k_neighbors)
-    if cross_patch and has_global_coords and coords.shape[0] > 1:
+    if use_global_graph:
         k_cross = int(cross_patch_k) if cross_patch_k is not None else int(k_neighbors)
-        edge_cross = _build_knn_graph_global(coords, k_cross)
+        edge_cross = _build_knn_graph_cross_patch(
+            coords,
+            patch_index,
+            global_mask,
+            k_cross,
+            radius=cross_patch_radius,
+        )
         edge_index = torch.cat([edge_index, edge_cross], dim=1)
         edge_index = _coalesce_edges(edge_index, n_nodes=int(coords.shape[0]))
     cells_per_patch_tensor = torch.tensor(

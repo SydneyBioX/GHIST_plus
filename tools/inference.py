@@ -533,8 +533,15 @@ def main():
         else 1,
         1,
     )
+    graph_cross_patch_radius = (
+        getattr(ecrm_cfg, "cross_patch_radius", None) if ecrm_cfg is not None else None
+    )
+    if graph_cross_patch_radius is not None:
+        graph_cross_patch_radius = float(graph_cross_patch_radius)
+        if graph_cross_patch_radius <= 0:
+            graph_cross_patch_radius = None
     slide_coord_map_by_slide = {}
-    if supports_cell_graph and hasattr(gba, "spatial_utils"):
+    if supports_cell_graph and getattr(model, "use_ecrm", False) and hasattr(gba, "spatial_utils"):
         for src in all_sources:
             sid = int(getattr(src, "slide_idx", -1))
             if sid in slide_coord_map_by_slide:
@@ -578,7 +585,7 @@ def main():
             expr_ref_batch = expr_ref_torch_map.get(slide_id_val, expr_ref_torch)
 
             model_extra_kwargs = {}
-            if supports_cell_graph:
+            if supports_cell_graph and getattr(model, "use_ecrm", False):
                 coord_map_slide = None
                 if isinstance(slide_coord_map_by_slide, dict):
                     coord_map_slide = slide_coord_map_by_slide.get(slide_id_val)
@@ -590,6 +597,7 @@ def main():
                     cell_coord_map=coord_map_slide,
                     cross_patch=bool(graph_cross_patch),
                     cross_patch_k=graph_cross_patch_k,
+                    cross_patch_radius=graph_cross_patch_radius,
                 )
                 model_extra_kwargs = {
                     "coords_cells": graph.coords,

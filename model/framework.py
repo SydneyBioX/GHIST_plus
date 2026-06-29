@@ -275,6 +275,11 @@ class Framework(nn.Module):
             self.ecrm_apply_to_embeddings = bool(getattr(ecrm_cfg, "apply_to_embeddings", True))
             self.ecrm_apply_to_ref_weights = bool(getattr(ecrm_cfg, "apply_to_ref_weights", False))
             self.ecrm_apply_to_expr_residual = bool(getattr(ecrm_cfg, "apply_to_expr_residual", False))
+            self.ecrm_residual_target = (
+                self.ecrm_apply_to_expr_residual
+                and not self.ecrm_apply_to_embeddings
+                and not self.ecrm_apply_to_ref_weights
+            )
             self.ecrm_ref_weights_alpha = float(getattr(ecrm_cfg, "ref_weights_alpha", 1.0))
             self.ecrm_expr_residual_alpha = float(getattr(ecrm_cfg, "expr_residual_alpha", 1.0))
             self.ecrm_use_gt_ct = bool(getattr(ecrm_cfg, "use_gt_ct", False))
@@ -324,6 +329,7 @@ class Framework(nn.Module):
             self.ecrm_apply_to_embeddings = False
             self.ecrm_apply_to_ref_weights = False
             self.ecrm_apply_to_expr_residual = False
+            self.ecrm_residual_target = False
             self.ecrm_ref_weights_alpha = 0.0
             self.ecrm_expr_residual_alpha = 0.0
             self.ecrm_use_gt_ct = False
@@ -331,8 +337,30 @@ class Framework(nn.Module):
         # Small projection of embeddings for ECRM expression similarity
         if self.use_ecrm:
             self.ecrm_expr_proj = nn.Linear(self.hidden_size, 32, bias=False)
+            if self.ecrm_residual_target:
+                self.ecrm_expr_contrast_proj = nn.Sequential(
+                    nn.Linear(n_genes, self.hidden_size),
+                    nn.GELU(),
+                    nn.Linear(self.hidden_size, self.hidden_size),
+                    nn.GELU(),
+                )
+                self.ecrm_graph_residual_head = nn.Sequential(
+                    nn.Linear(self.hidden_size * 4, self.hidden_size),
+                    nn.GELU(),
+                    nn.Linear(self.hidden_size, n_genes),
+                )
+                self.ecrm_graph_gene_gate_raw = nn.Parameter(torch.zeros(n_genes))
+                nn.init.zeros_(self.ecrm_graph_residual_head[-1].weight)
+                nn.init.zeros_(self.ecrm_graph_residual_head[-1].bias)
+            else:
+                self.ecrm_expr_contrast_proj = None
+                self.ecrm_graph_residual_head = None
+                self.ecrm_graph_gene_gate_raw = None
         else:
             self.ecrm_expr_proj = None
+            self.ecrm_expr_contrast_proj = None
+            self.ecrm_graph_residual_head = None
+            self.ecrm_graph_gene_gate_raw = None
 
         if self.use_celltype:
             self.mlp_hist = MLP(self.hidden_size, self.hidden_size, n_classes)
@@ -764,6 +792,8 @@ class Framework(nn.Module):
         expr_ref_gate = None
         expr_ref_gate_immune = None
         expr_ref_gate_invasive = None
+        graph_residual_delta = None
+        graph_residual_base = None
         if self.use_avgexp:
             # assume reference provided when avgexp is enabled
             ref = ref_orig.unsqueeze(0).to(device)
@@ -822,6 +852,7 @@ class Framework(nn.Module):
                 self.use_ecrm
                 and self.ecrm is not None
                 and self.ecrm_apply_to_expr_residual
+                and not self.ecrm_residual_target
                 and coords_all.size(0) > 1
                 and expr_direct.numel() > 0
             ):
@@ -841,8 +872,7 @@ class Framework(nn.Module):
                     edge_index=edge_index_cells,
                     patch_ids=patch_assign,
                 )
-                alpha = float(self.ecrm_expr_residual_alpha)
-                alpha = max(0.0, min(1.0, alpha))
+                alpha = max(0.0, min(1.0, float(self.ecrm_expr_residual_alpha)))
                 expr_direct = expr_direct + alpha * (expr_direct_mixed - expr_direct)
 
             out_expr, expr_ref_gate, _ = self._fuse_direct_with_ref(
@@ -852,6 +882,71 @@ class Framework(nn.Module):
                 self.expr_ref_gate_raw,
                 self.expr_ref_gate_max,
             )
+            if (
+                self.use_ecrm
+                and self.ecrm is not None
+                and self.ecrm_residual_target
+                and self.ecrm_graph_residual_head is not None
+                and coords_all.size(0) > 1
+                and out_expr.numel() > 0
+            ):
+                graph_residual_base = out_expr
+                expr_sim = None
+                if self.ecrm_expr_proj is not None:
+                    expr_sim = self.ecrm_expr_proj(embeddings_gate)
+                self.ecrm._patch_ids = patch_assign
+                graph_context = self.ecrm(
+                    embeddings_gate,
+                    coords_all,
+                    ct_prob_input,
+                    expr_pred=expr_sim,
+                    gate_h=embeddings_gate,
+                    immune_gate=immune_gate,
+                    invasive_gate=invasive_gate,
+                    edge_index=edge_index_cells,
+                    patch_ids=patch_assign,
+                )
+                self.ecrm._patch_ids = patch_assign
+                graph_base_context = self.ecrm(
+                    graph_residual_base.detach(),
+                    coords_all,
+                    ct_prob_input,
+                    expr_pred=expr_sim,
+                    gate_h=embeddings_gate,
+                    immune_gate=immune_gate,
+                    invasive_gate=invasive_gate,
+                    edge_index=edge_index_cells,
+                    patch_ids=patch_assign,
+                )
+                graph_expr_contrast = graph_residual_base.detach() - graph_base_context
+                graph_expr_contrast = torch.nan_to_num(
+                    graph_expr_contrast,
+                    nan=0.0,
+                    posinf=0.0,
+                    neginf=0.0,
+                )
+                graph_expr_contrast_feat = self.ecrm_expr_contrast_proj(graph_expr_contrast)
+                graph_features = torch.cat(
+                    [
+                        embeddings_gate,
+                        graph_context,
+                        graph_context - embeddings_gate,
+                        graph_expr_contrast_feat,
+                    ],
+                    dim=1,
+                )
+                graph_residual_delta = self.ecrm_graph_residual_head(graph_features)
+                graph_gene_gate = (
+                    2.0
+                    * torch.sigmoid(self.ecrm_graph_gene_gate_raw)
+                    .to(device=graph_residual_delta.device, dtype=graph_residual_delta.dtype)
+                    .view(1, -1)
+                )
+                graph_residual_delta = graph_residual_delta * graph_gene_gate
+                torch.nan_to_num_(graph_residual_delta, nan=0.0, posinf=0.0, neginf=0.0)
+                out_expr = out_expr + graph_residual_delta
+                if self.expr_relu:
+                    out_expr = self.relu(out_expr)
 
             ref_weights_immune = self._resolve_ref_weights(
                 self.mlp_weights_immune(embeddings), ct_prob_pred, ct_labels
@@ -1029,6 +1124,8 @@ class Framework(nn.Module):
             "expr_ref_gate": expr_ref_gate,
             "expr_ref_gate_immune": expr_ref_gate_immune,
             "expr_ref_gate_invasive": expr_ref_gate_invasive,
+            "ecrm_graph_residual_delta": graph_residual_delta,
+            "ecrm_graph_residual_base": graph_residual_base,
         }
 
         return (

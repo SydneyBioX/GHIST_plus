@@ -205,11 +205,18 @@ def preselect_tma_punch_with_vq(
             patch_coords = patch_coords.to(device)
             patch_slide_idx = patch_slide_idx.to(device)
 
-            graph = graph_utils.build_cell_graph(
-                batch_nuclei,
-                patch_ids,
-                k_neighbors=max(int(graph_k), 2),
-            )
+            model_extra_kwargs = {}
+            if getattr(model, "use_ecrm", False):
+                graph = graph_utils.build_cell_graph(
+                    batch_nuclei,
+                    patch_ids,
+                    k_neighbors=max(int(graph_k), 2),
+                )
+                model_extra_kwargs = {
+                    "coords_cells": graph.coords,
+                    "cell_edge_index": graph.edge_index,
+                    "cell_patch_ids": graph.patch_index,
+                }
             expr_ref_batch = (
                 expr_ref_torch_map.get(slide_idx, expr_ref_torch)
                 if isinstance(expr_ref_torch_map, dict)
@@ -223,9 +230,7 @@ def preselect_tma_punch_with_vq(
                 batch_ct,
                 batch_expr,
                 patch_ids=patch_ids,
-                coords_cells=graph.coords,
-                cell_edge_index=graph.edge_index,
-                cell_patch_ids=graph.patch_index,
+                **model_extra_kwargs,
             )
 
             aux = getattr(model, "last_aux_losses", {}) or {}
@@ -1167,19 +1172,26 @@ def main(config):
     test_sources = imputed_test
 
     # Spatial graph support
-    slide_coord_map_by_slide = {}
-    for src in (train_sources + test_sources):
-        sid = int(getattr(src, "slide_idx", -1))
-        if sid in slide_coord_map_by_slide:
-            continue
-        cmap = spatial_utils.load_histology_coord_map_from_source(src)
-        if cmap:
-            slide_coord_map_by_slide[sid] = cmap
-    logging.info(
-        "Loaded global cell-coordinate maps for %d slide(s).",
-        len(slide_coord_map_by_slide),
+    ecrm_cfg_for_graph = getattr(getattr(opts, "model", None), "ecrm", None)
+    ecrm_cross_patch_enabled = (
+        ecrm_cfg_for_graph is not None
+        and bool(getattr(ecrm_cfg_for_graph, "enabled", True))
+        and bool(getattr(ecrm_cfg_for_graph, "cross_patch", False))
     )
-    if bool(getattr(opts.model.ecrm, "cross_patch", False)) and len(slide_coord_map_by_slide) == 0:
+    slide_coord_map_by_slide = {}
+    if ecrm_cross_patch_enabled:
+        for src in (train_sources + test_sources):
+            sid = int(getattr(src, "slide_idx", -1))
+            if sid in slide_coord_map_by_slide:
+                continue
+            cmap = spatial_utils.load_histology_coord_map_from_source(src)
+            if cmap:
+                slide_coord_map_by_slide[sid] = cmap
+        logging.info(
+            "Loaded global cell-coordinate maps for %d slide(s).",
+            len(slide_coord_map_by_slide),
+        )
+    if ecrm_cross_patch_enabled and len(slide_coord_map_by_slide) == 0:
         logging.warning(
             "ECRM cross-patch requested but no global coordinate maps were found; "
             "graph will fall back to within-patch connectivity."
@@ -1581,12 +1593,18 @@ def main(config):
         graph_k = 8
         graph_cross_patch = False
         graph_cross_patch_k = 0
+        graph_cross_patch_radius = None
     else:
         graph_k = int(getattr(ecrm_cfg, "graph_k", getattr(ecrm_cfg, "k_target", 8)))
         graph_cross_patch = bool(getattr(ecrm_cfg, "cross_patch", False))
         graph_cross_patch_k = int(
             getattr(ecrm_cfg, "cross_patch_k", getattr(ecrm_cfg, "graph_k", graph_k))
         )
+        graph_cross_patch_radius = getattr(ecrm_cfg, "cross_patch_radius", None)
+        if graph_cross_patch_radius is not None:
+            graph_cross_patch_radius = float(graph_cross_patch_radius)
+            if graph_cross_patch_radius <= 0:
+                graph_cross_patch_radius = None
     graph_k = max(graph_k, 2)
     graph_cross_patch_k = max(graph_cross_patch_k, 1)
 
@@ -1681,6 +1699,15 @@ def main(config):
     svg_topk = (20, 50)
     svg_knn_k = 8
     svg_sample_cap = 3000
+    train_svg_rank_indices_by_slide = spatial_utils.compute_svg_rank_gene_indices_by_slide(
+        sources_trainval,
+        train_regions,
+        config.fold_id,
+        mode_name="train",
+        gene_names=gene_names,
+        k_neighbors=svg_knn_k,
+        sample_cap=svg_sample_cap,
+    )
     val_svg_rank_indices_by_slide = spatial_utils.compute_svg_rank_gene_indices_by_slide(
         sources_trainval,
         opts.regions_val,
@@ -1700,7 +1727,8 @@ def main(config):
         sample_cap=svg_sample_cap,
     )
     logging.info(
-        "Precomputed Giotto SVG ranks: val_slides=%d ext_slides=%d topk=%s kNN=%d sample_cap=%d",
+        "Precomputed Giotto SVG ranks: train_slides=%d val_slides=%d ext_slides=%d topk=%s kNN=%d sample_cap=%d",
+        len(train_svg_rank_indices_by_slide),
         len(val_svg_rank_indices_by_slide),
         len(ext_svg_rank_indices_by_slide),
         list(svg_topk),
@@ -1778,16 +1806,14 @@ def main(config):
 
     zero_weight = float(getattr(opts.training, "zero_weight", 0.1))
     zero_threshold = float(getattr(opts.training, "zero_threshold", 0.0))
-    pearson_loss_weight = float(getattr(opts.training, "pearson_loss_weight", 1.0))
     expr_ct_embed_loss_weight = float(
         getattr(opts.training, "expr_ct_embed_loss_weight", 1.0)
     )
     logits_loss_weight = float(getattr(opts.training, "logits_loss_weight", 1.0))
     logging.info(
-        "Loss setup: pearson=%.3f expr_ct_embed_w=%.3f "
+        "Loss setup: expr_ct_embed_w=%.3f "
         "logits_w=%.3f expr_ct_embed_internal=100 "
         "interleave_slide_batches=%s",
-        pearson_loss_weight,
         expr_ct_embed_loss_weight,
         logits_loss_weight,
         str(bool(getattr(opts.training, "interleave_slide_batches", True))),
@@ -1896,7 +1922,7 @@ def main(config):
             slide_id_val = int(slide_ids_unique.item())
             expr_ref_batch = expr_ref_torch_map.get(slide_id_val, expr_ref_torch)
             model_extra_kwargs = {}
-            if supports_cell_graph:
+            if supports_cell_graph and getattr(model, "use_ecrm", False):
                 coord_map_slide = slide_coord_map_by_slide.get(slide_id_val)
                 graph = graph_utils.build_cell_graph(
                     batch_nuclei,
@@ -1906,6 +1932,7 @@ def main(config):
                     cell_coord_map=coord_map_slide,
                     cross_patch=graph_cross_patch,
                     cross_patch_k=graph_cross_patch_k,
+                    cross_patch_radius=graph_cross_patch_radius,
                 )
                 model_extra_kwargs = {
                     "coords_cells": graph.coords,
@@ -2046,6 +2073,8 @@ def main(config):
 
             aux_main = getattr(model, "last_aux_losses", {}) or {}
             ref_base_main = aux_main.get("expr_ref_base")
+            graph_residual_delta = aux_main.get("ecrm_graph_residual_delta")
+            graph_residual_base = aux_main.get("ecrm_graph_residual_base")
             pred_expr_for_loss = out_expr
             target_expr_for_loss = batch_expr_pc
             if use_expr_baseline and baseline_torch is not None:
@@ -2054,6 +2083,20 @@ def main(config):
 
             loss_expr_val = masked_mse(pred_expr_for_loss, target_expr_for_loss, batch_expr_mask_pc)
             loss_map_val = loss_map(out_map, batch_type_patch)
+            (
+                loss_ecrm_graph_residual_val,
+                loss_ecrm_graph_gene_pcc_val,
+                loss_ecrm_graph_edge_contrast_val,
+            ) = metric_utils.graph_residual_loss_terms(
+                graph_residual_delta,
+                graph_residual_base,
+                batch_expr_pc,
+                batch_expr_mask_pc,
+                edge_index=model_extra_kwargs.get("cell_edge_index"),
+                svg_gene_order=train_svg_rank_indices_by_slide.get(int(slide_id_val)),
+                zero_threshold=zero_threshold,
+                zero_weight=zero_weight,
+            )
 
             loss_panel_completion_val = torch.tensor(0.0, device=device)
             if (
@@ -2270,16 +2313,6 @@ def main(config):
                 loss_expr_immune_val = torch.tensor(0.0).to(device)
                 loss_expr_invasive_val = torch.tensor(0.0).to(device)
 
-            pearson_weight_mult = pearson_loss_weight
-            if pearson_weight_mult > 0:
-                loss_pearson_val = metric_utils.masked_pearson(
-                    pred_expr_for_loss,
-                    target_expr_for_loss,
-                    batch_expr_mask_pc,
-                )
-            else:
-                loss_pearson_val = torch.tensor(0.0, device=device)
-
             var_pred = masked_var(out_expr, batch_expr_mask_pc)
             var_label = masked_var(batch_expr_pc, batch_expr_mask_pc)
             var_w_cfg = float(getattr(opts.training, "expr_var_penalty_weight", 0.0))
@@ -2323,10 +2356,12 @@ def main(config):
                 + logits_loss_weight * loss_logits_val
                 + loss_comp_est_val
                 + loss_comp_gt_val
-                + pearson_weight_mult * loss_pearson_val
                 + loss_var_val
                 + loss_entropy_val
                 + loss_vq_val
+                + loss_ecrm_graph_residual_val
+                + loss_ecrm_graph_gene_pcc_val
+                + loss_ecrm_graph_edge_contrast_val
             )
 
             loss_total = loss.detach()
@@ -2418,6 +2453,7 @@ def main(config):
                 graph_k=graph_k,
                 graph_cross_patch=graph_cross_patch,
                 graph_cross_patch_k=graph_cross_patch_k,
+                graph_cross_patch_radius=graph_cross_patch_radius,
                 slide_coord_map_by_slide=slide_coord_map_by_slide,
                 expr_ref_torch_map=expr_ref_torch_val_map,
                 holdout_mask_by_slide=None,
@@ -2450,6 +2486,7 @@ def main(config):
                 graph_k=graph_k,
                 graph_cross_patch=graph_cross_patch,
                 graph_cross_patch_k=graph_cross_patch_k,
+                graph_cross_patch_radius=graph_cross_patch_radius,
                 slide_coord_map_by_slide=slide_coord_map_by_slide,
                 expr_ref_torch_map=expr_ref_torch_map,
                 holdout_mask_by_slide=None,

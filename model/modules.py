@@ -146,7 +146,6 @@ class EdgeCondMixer(nn.Module):
             nn.GELU(),
             nn.Linear(96, 1),
         )
-        self.edge_norm = nn.LayerNorm(hidden_size)
         self.beta = nn.Parameter(torch.tensor(-0.5))   # residual gate
         self.debug_ecrm: bool = False
         self.softmax_temp = 0.7
@@ -162,27 +161,10 @@ class EdgeCondMixer(nn.Module):
         self.trust_floor_per_class = None
         self.trust_scale_per_class = None
         self.ct_conf_min = 0.0
-        self.ct_same_type_only = False
+        self.ct_same_type_only = True
         
         # debug throttle: print at most once every 5 s
         self._dbg_last = 0.0
-
-    def _apply_edge_norm(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Apply LayerNorm safely across mixed feature widths.
-        ECRM is reused on embeddings (D=hidden), CT ref weights (D=n_ref),
-        and expression residuals (D=n_genes), so fallback to non-affine
-        layer-norm when the configured affine norm shape does not match.
-        """
-        if isinstance(self.edge_norm, nn.LayerNorm):
-            norm_shape = self.edge_norm.normalized_shape
-            if isinstance(norm_shape, (tuple, list)) and len(norm_shape) == 1:
-                norm_dim = int(norm_shape[0])
-            else:
-                norm_dim = int(norm_shape)
-            if x.shape[-1] == norm_dim:
-                return self.edge_norm(x)
-        return F.layer_norm(x, (x.shape[-1],))
 
     def _forward_dense(self,
                 h: torch.Tensor,          # (N,D)
@@ -580,14 +562,19 @@ class EdgeCondMixer(nn.Module):
             agg.index_add_(0, src, weights.unsqueeze(-1) * msg)
             agg = torch.where(valid_row.unsqueeze(-1), agg, h_native)
 
+            r = float(getattr(self, "epoch_frac", 1.0))
+            target_trust = (
+                float(getattr(self, "trust_floor", 0.1))
+                + float(getattr(self, "trust_scale", 0.9)) * r * ct_conf
+            ).clamp(0.0, 1.0)
             beta_vec = torch.sigmoid(self.beta).to(h_native.dtype).view(1, 1).expand(n_nodes, 1)
+            beta_vec = beta_vec * target_trust.to(h_native.dtype)
             if immune_gate is not None:
                 beta_vec = beta_vec * (1.0 - 0.2 * immune_gate.view(-1, 1).to(beta_vec.dtype))
             if invasive_gate is not None:
                 beta_vec = beta_vec * (1.0 + 0.2 * invasive_gate.view(-1, 1).to(beta_vec.dtype))
 
             out = h_native + beta_vec * (agg - h_native)
-            out = self._apply_edge_norm(out)
 
         return out.to(h.dtype)
 

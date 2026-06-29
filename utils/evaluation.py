@@ -22,6 +22,7 @@ def evaluate_validation(
     graph_k=None,
     graph_cross_patch=False,
     graph_cross_patch_k=None,
+    graph_cross_patch_radius=None,
     slide_coord_map_by_slide=None,
     expr_ref_torch_map=None,
     holdout_mask_by_slide=None,
@@ -117,7 +118,7 @@ def evaluate_validation(
             slide_id_val = int(slide_ids_unique.item())
             expr_ref_batch = expr_ref_torch_map.get(slide_id_val, expr_ref_torch)
             model_extra_kwargs = {}
-            if supports_cell_graph:
+            if supports_cell_graph and getattr(model, "use_ecrm", False):
                 coord_map_slide = None
                 if isinstance(slide_coord_map_by_slide, dict):
                     coord_map_slide = slide_coord_map_by_slide.get(slide_id_val)
@@ -129,6 +130,7 @@ def evaluate_validation(
                     cell_coord_map=coord_map_slide,
                     cross_patch=bool(graph_cross_patch),
                     cross_patch_k=graph_cross_patch_k,
+                    cross_patch_radius=graph_cross_patch_radius,
                 )
                 model_extra_kwargs = {
                     "coords_cells": graph.coords,
