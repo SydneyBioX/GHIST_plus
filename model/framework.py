@@ -193,7 +193,15 @@ class Framework(nn.Module):
                 self.mlp_avgexp_residual = MLP(self.hidden_size, self.hidden_size, n_genes)
                 self.mlp_avgexp_residual_immune = MLP(self.hidden_size, self.hidden_size, n_genes)
                 self.mlp_avgexp_residual_invasive = MLP(self.hidden_size, self.hidden_size, n_genes)
+                scale_init = max(self.avgexp_residual_scale, 1e-6)
+                scale_raw = math.log(math.expm1(scale_init)) if scale_init < 20.0 else scale_init
+                self.avgexp_residual_scale_raw = nn.Parameter(
+                    torch.full((n_genes,), float(scale_raw))
+                )
+            else:
+                self.register_parameter("avgexp_residual_scale_raw", None)
         else:
+            self.register_parameter("avgexp_residual_scale_raw", None)
             self.mlp_offset = MLP(self.hidden_size, self.hidden_size, n_genes)
             self.mlp_offset_immune = MLP(
                 self.hidden_size, self.hidden_size, n_genes
@@ -282,6 +290,14 @@ class Framework(nn.Module):
             )
             self.ecrm_ref_weights_alpha = float(getattr(ecrm_cfg, "ref_weights_alpha", 1.0))
             self.ecrm_expr_residual_alpha = float(getattr(ecrm_cfg, "expr_residual_alpha", 1.0))
+            if self.ecrm_apply_to_expr_residual and not self.ecrm_residual_target:
+                alpha_init = min(max(self.ecrm_expr_residual_alpha, 1e-6), 1.0 - 1e-6)
+                alpha_raw = math.log(alpha_init / (1.0 - alpha_init))
+                self.ecrm_expr_residual_alpha_raw = nn.Parameter(
+                    torch.tensor(float(alpha_raw))
+                )
+            else:
+                self.register_parameter("ecrm_expr_residual_alpha_raw", None)
             self.ecrm_use_gt_ct = bool(getattr(ecrm_cfg, "use_gt_ct", False))
             self.ecrm_gate_h_from_embeddings = bool(
                 getattr(ecrm_cfg, "gate_h_from_embeddings", False)
@@ -332,6 +348,7 @@ class Framework(nn.Module):
             self.ecrm_residual_target = False
             self.ecrm_ref_weights_alpha = 0.0
             self.ecrm_expr_residual_alpha = 0.0
+            self.register_parameter("ecrm_expr_residual_alpha_raw", None)
             self.ecrm_use_gt_ct = False
             self.ecrm_gate_h_from_embeddings = False
         # Small projection of embeddings for ECRM expression similarity
@@ -416,18 +433,33 @@ class Framework(nn.Module):
         mixed = (1.0 - alpha) * learned + alpha * prior
         return mixed / mixed.sum(dim=1, keepdim=True).clamp_min(1e-6)
 
+    def _scale_avgexp_residual(self, residual):
+        scale_raw = getattr(self, "avgexp_residual_scale_raw", None)
+        if scale_raw is None:
+            return self.avgexp_residual_scale * residual
+        scale = F.softplus(scale_raw).to(device=residual.device, dtype=residual.dtype)
+        return residual * scale.view(1, -1)
+
+    def _ecrm_expr_residual_alpha(self, ref_tensor):
+        alpha_raw = getattr(self, "ecrm_expr_residual_alpha_raw", None)
+        if alpha_raw is None:
+            alpha = max(0.0, min(1.0, float(self.ecrm_expr_residual_alpha)))
+            return ref_tensor.new_tensor(alpha)
+        return torch.sigmoid(alpha_raw).to(device=ref_tensor.device, dtype=ref_tensor.dtype)
+
     def _fuse_direct_with_ref(self, expr_direct, ref_base, ref_offsets, gate_raw, gate_max):
-        ref_corr = ref_base if ref_offsets is None else (ref_base + ref_offsets)
         if gate_raw is None or gate_max is None:
-            gate = ref_corr.new_tensor(1.0)
+            gate = ref_base.new_tensor(1.0)
         else:
             gate = torch.sigmoid(gate_raw).to(
-                device=ref_corr.device, dtype=ref_corr.dtype
+                device=ref_base.device, dtype=ref_base.dtype
             ) * float(gate_max)
-        out_expr = expr_direct + gate * ref_corr
+        out_expr = expr_direct + gate * ref_base
+        if ref_offsets is not None:
+            out_expr = out_expr + ref_offsets
         if self.expr_relu:
             out_expr = self.relu(out_expr)
-        return out_expr, gate, ref_corr
+        return out_expr, gate
 
     def _freeze_encoder(self, trainable_blocks: int = 0):
         for p in self.cnn.parameters():
@@ -843,7 +875,7 @@ class Framework(nn.Module):
                 ref_offsets = ref_offsets * cross_gate
             if self.use_avgexp_residual and hasattr(self, "mlp_avgexp_residual"):
                 ref_residual, _ = self.mlp_avgexp_residual(embeddings)
-                expr_direct = self.avgexp_residual_scale * ref_residual
+                expr_direct = self._scale_avgexp_residual(ref_residual)
             else:
                 expr_direct = torch.zeros_like(ref_weighted)
             torch.nan_to_num_(expr_direct, nan=0.0, posinf=0.0, neginf=0.0)
@@ -872,10 +904,10 @@ class Framework(nn.Module):
                     edge_index=edge_index_cells,
                     patch_ids=patch_assign,
                 )
-                alpha = max(0.0, min(1.0, float(self.ecrm_expr_residual_alpha)))
+                alpha = self._ecrm_expr_residual_alpha(expr_direct)
                 expr_direct = expr_direct + alpha * (expr_direct_mixed - expr_direct)
 
-            out_expr, expr_ref_gate, _ = self._fuse_direct_with_ref(
+            out_expr, expr_ref_gate = self._fuse_direct_with_ref(
                 expr_direct,
                 ref_weighted,
                 ref_offsets,
@@ -966,11 +998,11 @@ class Framework(nn.Module):
                 ref_offsets_immune = ref_offsets_immune * gate_immune
             if self.use_avgexp_residual and hasattr(self, "mlp_avgexp_residual_immune"):
                 ref_residual_immune, _ = self.mlp_avgexp_residual_immune(embeddings)
-                expr_direct_immune = self.avgexp_residual_scale * ref_residual_immune
+                expr_direct_immune = self._scale_avgexp_residual(ref_residual_immune)
             else:
                 expr_direct_immune = torch.zeros_like(ref_immune)
             torch.nan_to_num_(expr_direct_immune, nan=0.0, posinf=0.0, neginf=0.0)
-            out_expr_immune, expr_ref_gate_immune, _ = self._fuse_direct_with_ref(
+            out_expr_immune, expr_ref_gate_immune = self._fuse_direct_with_ref(
                 expr_direct_immune,
                 ref_immune,
                 ref_offsets_immune,
@@ -996,11 +1028,11 @@ class Framework(nn.Module):
                 ref_offsets_invasive = ref_offsets_invasive * gate_invasive
             if self.use_avgexp_residual and hasattr(self, "mlp_avgexp_residual_invasive"):
                 ref_residual_inv, _ = self.mlp_avgexp_residual_invasive(embeddings)
-                expr_direct_invasive = self.avgexp_residual_scale * ref_residual_inv
+                expr_direct_invasive = self._scale_avgexp_residual(ref_residual_inv)
             else:
                 expr_direct_invasive = torch.zeros_like(ref_invasive)
             torch.nan_to_num_(expr_direct_invasive, nan=0.0, posinf=0.0, neginf=0.0)
-            out_expr_invasive, expr_ref_gate_invasive, _ = self._fuse_direct_with_ref(
+            out_expr_invasive, expr_ref_gate_invasive = self._fuse_direct_with_ref(
                 expr_direct_invasive,
                 ref_invasive,
                 ref_offsets_invasive,
@@ -1124,6 +1156,16 @@ class Framework(nn.Module):
             "expr_ref_gate": expr_ref_gate,
             "expr_ref_gate_immune": expr_ref_gate_immune,
             "expr_ref_gate_invasive": expr_ref_gate_invasive,
+            "avgexp_residual_scale": (
+                F.softplus(self.avgexp_residual_scale_raw).detach()
+                if getattr(self, "avgexp_residual_scale_raw", None) is not None
+                else None
+            ),
+            "ecrm_expr_residual_alpha": (
+                torch.sigmoid(self.ecrm_expr_residual_alpha_raw).detach()
+                if getattr(self, "ecrm_expr_residual_alpha_raw", None) is not None
+                else None
+            ),
             "ecrm_graph_residual_delta": graph_residual_delta,
             "ecrm_graph_residual_base": graph_residual_base,
         }

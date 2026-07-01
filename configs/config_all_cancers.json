@@ -42,7 +42,6 @@
     },
     "model": {
         "emb_dim": 1024,
-        "avgexp_residual_scale": 0,
         "ecrm": {
             "k_target": 12,
             "k_min": 6,

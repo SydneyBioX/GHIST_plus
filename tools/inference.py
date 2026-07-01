@@ -242,7 +242,7 @@ def main():
     parser.add_argument("--slide_id", type=int, default=3)
     parser.add_argument("--impute_dir", type=str, required=True, help="Directory containing cached imputed expr.csv/mask.npy files.")
     parser.add_argument("--nature_root", type=str, default=str(Path(__file__).resolve().parents[1]), help="Path to the GHIST+ package root.")
-    parser.add_argument("--num_workers", type=int, default=0)
+    parser.add_argument("--num_workers", type=int, default=-1, help="-1 uses config data.num_workers")
     parser.add_argument("--batch_size", type=int, default=0, help="0 uses config training.batch_size")
     parser.add_argument("--output_dir", type=str, default="")
     parser.add_argument("--save_counts_csv", action="store_true")
@@ -308,6 +308,9 @@ def main():
     _log(f"[INFO] checkpoint candidates (best-first): {[p.name for p in checkpoint_candidates[:5]]}")
 
     device = get_device(args.gpu_id)
+    device_type = torch.device(device).type
+    if device_type == "cuda":
+        torch.backends.cudnn.benchmark = True
     _log(f"[INFO] device={device}")
 
     classes = list(getattr(opts.data, "cell_types", []))
@@ -401,34 +404,73 @@ def main():
         immune_class_multipliers=None,
     )
     batch_size = int(args.batch_size) if int(args.batch_size) > 0 else int(getattr(opts.training, "batch_size", 64))
-    dataloader = DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=max(0, int(args.num_workers)),
-        drop_last=False,
-        pin_memory=False,
+    num_workers = int(args.num_workers)
+    if num_workers < 0:
+        num_workers = int(getattr(opts.data, "num_workers", 0))
+    num_workers = max(0, num_workers)
+    pin_memory = bool(device_type == "cuda" and getattr(opts.data, "pin_memory", True))
+    loader_kwargs = {
+        "dataset": dataset,
+        "batch_size": batch_size,
+        "shuffle": False,
+        "num_workers": num_workers,
+        "drop_last": False,
+        "pin_memory": pin_memory,
+    }
+    if num_workers > 0:
+        loader_kwargs["persistent_workers"] = True
+        loader_kwargs["prefetch_factor"] = int(getattr(opts.data, "prefetch_factor", 2))
+    dataloader = DataLoader(**loader_kwargs)
+    _log(
+        f"[INFO] dataloader batches={len(dataloader)} batch_size={batch_size} "
+        f"num_workers={num_workers} pin_memory={pin_memory}"
     )
-    _log(f"[INFO] dataloader batches={len(dataloader)} batch_size={batch_size}")
 
     all_sources = train_sources + test_sources
     expr_ref_torch_map = {}
+    avgexp_mode = None
     if use_avgexp:
-        avgexp_df_by_slide = gba.reference_utils.build_avgexp_df_by_slide(
-            all_sources,
-            train_sources,
-            gene_names,
-            classes,
-            expr_scale,
-            holdout_mask_by_slide=None,
-            domain_specific=avgexp_domain_specific,
-        )
+        if eval_split == "trainval":
+            train_regions = getattr(opts, "regions_train", None)
+            if train_regions is None:
+                train_regions = getattr(opts, "regions_val", None)
+            if train_regions is None:
+                raise ValueError(
+                    "regions_train or regions_val is required for trainval avgexp priors."
+                )
+            avgexp_df_by_slide = gba.reference_utils.build_train_region_avgexp_df_by_slide(
+                train_sources,
+                train_regions,
+                int(args.fold_id),
+                gene_names,
+                classes,
+                expr_scale,
+                holdout_mask_by_slide=None,
+                domain_specific=avgexp_domain_specific,
+            )
+            avgexp_mode = (
+                "domain-specific train-region-only"
+                if avgexp_domain_specific
+                else "train-region-only"
+            )
+        else:
+            avgexp_df_by_slide = gba.reference_utils.build_avgexp_df_by_slide(
+                all_sources,
+                train_sources,
+                gene_names,
+                classes,
+                expr_scale,
+                holdout_mask_by_slide=None,
+                domain_specific=avgexp_domain_specific,
+            )
+            avgexp_mode = (
+                "domain-specific source-trainval-only"
+                if avgexp_domain_specific
+                else "source-trainval-only"
+            )
         if not avgexp_df_by_slide:
-            raise RuntimeError("Failed to compute avgexp priors from train/val statistics.")
-        _log(
-            "[INFO] avgexp ref mode="
-            + ("domain-specific trainval-only" if avgexp_domain_specific else "global trainval-only")
-        )
+            raise RuntimeError(f"Failed to compute avgexp priors for mode={avgexp_mode}.")
+        _log("[INFO] avgexp ref mode=" + avgexp_mode)
 
         ref_counts = []
         ref_stack = []
@@ -452,11 +494,11 @@ def main():
         expr_ref_mean = np.nanmean(np.stack(ref_stack, axis=0), axis=0)
         expr_ref_torch = torch.from_numpy(expr_ref_mean).float().to(device)
         _log(
-            "[INFO] slide-specific ref map built from trainval stats for slides: "
-            f"{sorted(expr_ref_torch_map.keys())}"
+            "[INFO] slide-specific ref map built from avgexp mode %s for slides: %s"
+            % (avgexp_mode, sorted(expr_ref_torch_map.keys()))
         )
         if int(args.slide_id) in expr_ref_torch_map:
-            _log(f"[INFO] using slide-specific train-derived ref for eval slide {int(args.slide_id)}")
+            _log(f"[INFO] using slide-specific avgexp ref for eval slide {int(args.slide_id)}")
         else:
             _log(f"[WARN] eval slide {int(args.slide_id)} missing from ref map; falling back to mean ref")
     else:
@@ -562,7 +604,7 @@ def main():
     n_batches = max(len(dataloader), 1)
     log_every = max(1, int(args.log_every))
 
-    with torch.no_grad():
+    with torch.inference_mode():
         for batch_idx, (
             batch_nuclei,
             _batch_type_patch,
@@ -574,10 +616,10 @@ def main():
             _batch_expr_mask,
             batch_slide_id,
         ) in enumerate(dataloader):
-            batch_nuclei = batch_nuclei.to(device)
-            batch_he_img = batch_he_img.to(device)
-            batch_n_cells = batch_n_cells.to(device)
-            patch_ids = patch_ids.to(device)
+            batch_nuclei = batch_nuclei.to(device, non_blocking=pin_memory)
+            batch_he_img = batch_he_img.to(device, non_blocking=pin_memory)
+            batch_n_cells = batch_n_cells.to(device, non_blocking=pin_memory)
+            patch_ids = patch_ids.to(device, non_blocking=pin_memory)
             slide_ids_unique = torch.unique(batch_slide_id)
             if slide_ids_unique.numel() != 1:
                 raise RuntimeError("Mixed slides in batch; set batch_size=1 for per-slide avgexp.")
@@ -673,7 +715,7 @@ def main():
     uniq_ids, idx_start, counts = np.unique(ids, return_index=True, return_counts=True)
     sum_preds = np.add.reduceat(preds, idx_start, axis=0)
     pred_scaled = sum_preds / counts[:, None].astype(np.float32)
-
+    aggregation_mode = "mean"
     mean_ct_probs = None
     ct_pred = None
     ct_conf = None
@@ -683,7 +725,10 @@ def main():
         mean_ct_probs = sum_ct_probs / counts[:, None].astype(np.float32)
         ct_pred = mean_ct_probs.argmax(axis=1).astype(np.int64)
         ct_conf = mean_ct_probs.max(axis=1).astype(np.float32)
-    _log(f"[INFO] aggregation complete; unique_cells={uniq_ids.size}")
+    _log(
+        "[INFO] aggregation complete; unique_cells=%d mode=%s"
+        % (uniq_ids.size, aggregation_mode)
+    )
 
     stem = (
         f"{eval_split}_slide{int(args.slide_id)}_train_epoch"
@@ -710,6 +755,8 @@ def main():
         "cell_ids": uniq_ids.astype(np.int64),
         "pred_expr_scaled": pred_scaled.astype(np.float32),
         "gene_names": np.asarray(gene_names, dtype=object),
+        "aggregation_mode": np.asarray(aggregation_mode, dtype=object),
+        "occurrence_counts": counts.astype(np.int64),
     }
     if ct_pred is not None:
         npz_payload["ct_pred"] = ct_pred
@@ -760,6 +807,7 @@ def main():
             graph_k=graph_k,
             graph_cross_patch=graph_cross_patch,
             graph_cross_patch_k=graph_cross_patch_k,
+            graph_cross_patch_radius=graph_cross_patch_radius,
             slide_coord_map_by_slide=slide_coord_map_by_slide,
             expr_ref_torch_map=expr_ref_torch_map,
             holdout_mask_by_slide=None,
@@ -795,15 +843,17 @@ def main():
         "domain_id": eval_domain_id,
         "split": eval_split,
         "dataset_mode": export_mode,
-        "reference_mode": "slide_specific_train_derived_ref",
+        "reference_mode": avgexp_mode,
         "prior_domain_id": eval_domain_id,
         "prior_slides": sorted(int(x) for x in expr_ref_torch_map.keys()),
         "n_cells_output": int(uniq_ids.size),
+        "n_patch_cell_predictions": int(n_output_cells),
+        "aggregation_mode": aggregation_mode,
         "n_genes": int(n_genes),
         "n_classes": int(n_classes),
         "expr_scale": float(expr_scale),
         "gpu_id": int(args.gpu_id),
-        "num_workers": int(args.num_workers),
+        "num_workers": int(num_workers),
         "batch_size": int(batch_size),
         "use_gt_ct_ref_weights": False,
         "metrics": metrics,
