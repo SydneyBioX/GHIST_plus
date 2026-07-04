@@ -2084,9 +2084,9 @@ def main(config):
             loss_expr_val = masked_mse(pred_expr_for_loss, target_expr_for_loss, batch_expr_mask_pc)
             loss_map_val = loss_map(out_map, batch_type_patch)
             (
-                loss_ecrm_graph_residual_val,
-                loss_ecrm_graph_gene_pcc_val,
-                loss_ecrm_graph_edge_contrast_val,
+                ecrm_residual_term_val,
+                ecrm_gene_corr_term_val,
+                ecrm_edge_contrast_term_val,
             ) = metric_utils.graph_residual_loss_terms(
                 graph_residual_delta,
                 graph_residual_base,
@@ -2096,6 +2096,11 @@ def main(config):
                 svg_gene_order=train_svg_rank_indices_by_slide.get(int(slide_id_val)),
                 zero_threshold=zero_threshold,
                 zero_weight=zero_weight,
+            )
+            loss_ecrm_val = (
+                ecrm_residual_term_val
+                + ecrm_gene_corr_term_val
+                + ecrm_edge_contrast_term_val
             )
 
             loss_panel_completion_val = torch.tensor(0.0, device=device)
@@ -2321,47 +2326,35 @@ def main(config):
             else:
                 loss_var_val = torch.tensor(0.0, device=device)
 
-            entropy_w = float(getattr(opts.training, "ref_entropy_weight", 0.0))
-            if entropy_w > 0:
-                aux = getattr(model, "last_aux_losses", {})
-                ent_base = aux.get("ref_weight_entropy")
-                ent_imm = aux.get("ref_weight_entropy_immune")
-                ent_inv = aux.get("ref_weight_entropy_invasive")
-                ent_terms = [
-                    x for x in (ent_base, ent_imm, ent_inv)
-                    if x is not None and torch.isfinite(x)
-                ]
-                if ent_terms:
-                    entropy_gain = torch.stack(ent_terms).mean()
-                    loss_entropy_val = -entropy_w * entropy_gain
-                else:
-                    loss_entropy_val = torch.tensor(0.0, device=device)
-            else:
-                loss_entropy_val = torch.tensor(0.0, device=device)
-
             aux_losses = getattr(model, "last_aux_losses", {})
             loss_vq_val = aux_losses.get(
                 "vq_patch", torch.tensor(0.0, device=device)
             )
 
-            loss = (
+            loss_expression_val = (
+                loss_expr_val
+                + loss_ecrm_val
+                + loss_expr_immune_val
+                + loss_expr_invasive_val
+                + loss_var_val
+            )
+            loss_celltype_val = (
                 loss_map_val
                 + loss_ct_hist_val
                 + loss_expr_ct_val
-                + loss_expr_val
-                + panel_completion_loss_weight * loss_panel_completion_val
-                + loss_expr_immune_val
-                + loss_expr_invasive_val
                 + expr_ct_embed_loss_weight * loss_expr_ct_embed_val
                 + logits_loss_weight * loss_logits_val
-                + loss_comp_est_val
-                + loss_comp_gt_val
-                + loss_var_val
-                + loss_entropy_val
+            )
+            loss_composition_val = loss_comp_est_val + loss_comp_gt_val
+            loss_auxiliary_val = (
+                panel_completion_loss_weight * loss_panel_completion_val
                 + loss_vq_val
-                + loss_ecrm_graph_residual_val
-                + loss_ecrm_graph_gene_pcc_val
-                + loss_ecrm_graph_edge_contrast_val
+            )
+            loss = (
+                loss_expression_val
+                + loss_celltype_val
+                + loss_composition_val
+                + loss_auxiliary_val
             )
 
             loss_total = loss.detach()
