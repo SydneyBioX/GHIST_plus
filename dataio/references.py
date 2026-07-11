@@ -46,6 +46,187 @@ def source_domain_id(src):
         return 0
 
 
+def _normalize_holdout_fill_strategy(strategy):
+    strategy = str(strategy or "leave_one_slide_out").strip().lower()
+    aliases = {
+        "leave-one-slide-out": "leave_one_slide_out",
+        "loso": "leave_one_slide_out",
+        "zero": "zero",
+        "zeros": "zero",
+        "neutral": "zero",
+    }
+    strategy = aliases.get(strategy, strategy)
+    if strategy not in {"leave_one_slide_out", "zero"}:
+        raise ValueError(
+            "holdout_fill_strategy must be 'leave_one_slide_out' or 'zero'."
+        )
+    return strategy
+
+
+def _divide_or_nan(numerator, denominator):
+    with np.errstate(divide="ignore", invalid="ignore"):
+        out = np.full_like(numerator, np.nan, dtype=np.float64)
+        np.divide(numerator, denominator, out=out, where=denominator > 0)
+    return out
+
+
+def _holdout_mask_for_slide(holdout_mask_by_slide, slide_id, n_genes):
+    holdout_mask = holdout_mask_by_slide.get(slide_id)
+    if holdout_mask is None:
+        return np.zeros(n_genes, dtype=bool)
+    return np.asarray(holdout_mask, dtype=bool)
+
+
+def _apply_holdout_fill(
+    ref,
+    holdout_mask_bool,
+    *,
+    strategy,
+    base_ct_sums,
+    base_ct_counts,
+    slide_sums,
+    slide_counts,
+):
+    if not holdout_mask_bool.any():
+        return ref
+
+    hold_idx = np.where(holdout_mask_bool)[0]
+    if strategy == "zero":
+        ref[:, hold_idx] = 0.0
+        return ref
+
+    if slide_sums is None or slide_counts is None:
+        return ref
+
+    excl_sums = base_ct_sums - slide_sums
+    excl_counts = base_ct_counts - slide_counts
+    excl_means = _divide_or_nan(excl_sums, excl_counts)
+    excl_gene_mean = _divide_or_nan(
+        excl_sums.sum(axis=0),
+        excl_counts.sum(axis=0),
+    )
+
+    fill_block = excl_means[:, hold_idx]
+    fallback = np.broadcast_to(excl_gene_mean[hold_idx], fill_block.shape)
+    fill_block = np.where(np.isfinite(fill_block), fill_block, fallback)
+    ref[:, hold_idx] = np.where(np.isfinite(fill_block), fill_block, 0.0)
+    return ref
+
+
+def _finalize_ref(ref, *, global_ct_means, base_gene_mean, gene_mean_global):
+    ref = np.where(np.isfinite(ref), ref, global_ct_means)
+    ref = np.where(np.isfinite(ref), ref, np.broadcast_to(base_gene_mean, ref.shape))
+    ref = np.where(np.isfinite(ref), ref, np.broadcast_to(gene_mean_global, ref.shape))
+    return np.nan_to_num(ref, nan=0.0, posinf=0.0, neginf=0.0)
+
+
+def build_train_region_expression_fallbacks(
+    src_list,
+    train_regions,
+    fold_id: int,
+    gene_names,
+    classes=None,
+    *,
+    expr_per_source=None,
+):
+    """Raw-scale fallback means from train-region cells only."""
+    gene_names = list(gene_names or [])
+    if not src_list or not gene_names:
+        return pd.Series(dtype=np.float64), None
+
+    expr_per_source = expr_per_source or {}
+    classes = list(classes or [])
+    n_genes = len(gene_names)
+    n_classes = len(classes)
+    divisions_fold = spatial_utils.resolve_divisions_fold(train_regions, fold_id)
+
+    gene_sums = np.zeros(n_genes, dtype=np.float64)
+    gene_counts = np.zeros(n_genes, dtype=np.int64)
+    ct_sums = np.zeros((n_classes, n_genes), dtype=np.float64) if n_classes else None
+    ct_counts = np.zeros((n_classes, n_genes), dtype=np.int64) if n_classes else None
+
+    for src in src_list:
+        slide_id = int(getattr(src, "slide_idx", -1))
+        fp_expr = getattr(src, "fp_expr", None)
+        if fp_expr is None or not os.path.isfile(fp_expr):
+            logging.warning("Train-region expression fallback skipped for slide %s: missing fp_expr", slide_id)
+            continue
+
+        if fp_expr in expr_per_source:
+            df_expr = expr_per_source[fp_expr].reindex(columns=gene_names)
+        else:
+            df_expr = pd.read_csv(fp_expr, index_col=0).reindex(columns=gene_names)
+        try:
+            df_expr.index = df_expr.index.astype(int)
+        except Exception:
+            pass
+
+        coord_map = spatial_utils.load_histology_coord_map_from_source(src)
+        if not coord_map:
+            logging.warning("Train-region expression fallback skipped for slide %s: missing coord map", slide_id)
+            continue
+
+        common_ids = [int(cid) for cid in df_expr.index if int(cid) in coord_map]
+        if not common_ids:
+            logging.warning(
+                "Train-region expression fallback skipped for slide %s: no overlapping cells with coords",
+                slide_id,
+            )
+            continue
+
+        whole_h, _ = spatial_utils.read_image_hw(getattr(src, "fp_hist"))
+        y_coords = np.asarray([float(coord_map[cid][0]) for cid in common_ids], dtype=np.float64)
+        keep_train = spatial_utils.select_region_rows(y_coords, whole_h, divisions_fold, mode="train")
+        train_ids = np.asarray(common_ids, dtype=np.int64)[keep_train]
+        if train_ids.size == 0:
+            logging.warning("Train-region expression fallback skipped for slide %s: empty train region", slide_id)
+            continue
+
+        expr_arr = df_expr.loc[train_ids].to_numpy(dtype=np.float64)
+        valid_mask = np.isfinite(expr_arr)
+        gene_sums += np.nansum(np.where(valid_mask, expr_arr, 0.0), axis=0)
+        gene_counts += valid_mask.sum(axis=0)
+
+        if n_classes:
+            ct_series = load_ct_series_for_classes(getattr(src, "fp_cell_type", None), classes)
+            if ct_series is None:
+                continue
+            try:
+                ct_series.index = ct_series.index.astype(int)
+            except Exception:
+                pass
+            ct_ids = [int(cid) for cid in train_ids if int(cid) in ct_series.index]
+            if not ct_ids:
+                continue
+            expr_ct = df_expr.loc[ct_ids].to_numpy(dtype=np.float64)
+            ct_arr = ct_series.loc[ct_ids].to_numpy(dtype=np.int64)
+            valid_ct = np.isfinite(expr_ct)
+            for ct_val in np.unique(ct_arr):
+                if ct_val < 0 or ct_val >= n_classes:
+                    continue
+                rows = ct_arr == ct_val
+                if not rows.any():
+                    continue
+                ct_sums[ct_val] += np.nansum(np.where(valid_ct[rows], expr_ct[rows], 0.0), axis=0)
+                ct_counts[ct_val] += valid_ct[rows].sum(axis=0)
+
+    gene_means = _divide_or_nan(gene_sums, gene_counts)
+    gene_means = np.where(np.isfinite(gene_means), gene_means, 0.0)
+    gene_means_series = pd.Series(gene_means, index=gene_names)
+
+    if not n_classes:
+        return gene_means_series, None
+
+    ct_means = _divide_or_nan(ct_sums, ct_counts)
+    ct_means_fallback = np.where(
+        ct_counts > 0,
+        ct_means,
+        np.broadcast_to(gene_means, ct_means.shape),
+    )
+    ct_means_fallback = np.nan_to_num(ct_means_fallback, nan=0.0, posinf=0.0, neginf=0.0)
+    return gene_means_series, ct_means_fallback
+
+
 def build_avgexp_df_by_slide(
     all_sources,
     stats_sources,
@@ -56,6 +237,7 @@ def build_avgexp_df_by_slide(
     holdout_mask_by_slide=None,
     expr_per_source=None,
     domain_specific: bool = False,
+    holdout_fill_strategy: str = "leave_one_slide_out",
 ):
     """
     Build per-slide avgexp priors directly from raw expression + cell-type files.
@@ -75,6 +257,7 @@ def build_avgexp_df_by_slide(
 
     holdout_mask_by_slide = holdout_mask_by_slide or {}
     expr_per_source = expr_per_source or {}
+    holdout_fill_strategy = _normalize_holdout_fill_strategy(holdout_fill_strategy)
 
     n_classes_local = len(classes)
     n_genes_local = len(gene_names)
@@ -202,60 +385,35 @@ def build_avgexp_df_by_slide(
             base_ct_means = domain_ct_means_map[domain_id]
             base_gene_mean = domain_gene_mean_map[domain_id]
 
-        if sums is not None and counts is not None:
-            with np.errstate(divide="ignore", invalid="ignore"):
-                slide_means = np.full_like(sums, np.nan, dtype=np.float64)
-                np.divide(sums, counts, out=slide_means, where=counts > 0)
-        else:
-            slide_means = None
+        slide_means = _divide_or_nan(sums, counts) if sums is not None else None
 
         ref = base_ct_means.copy()
         present_mask = (
             counts.sum(axis=0) > 0 if counts is not None else np.zeros(n_genes_local, dtype=bool)
         )
-        holdout_mask = holdout_mask_by_slide.get(slide_id)
-        if holdout_mask is None:
-            holdout_mask_bool = np.zeros(n_genes_local, dtype=bool)
-        else:
-            holdout_mask_bool = np.asarray(holdout_mask, dtype=bool)
+        holdout_mask_bool = _holdout_mask_for_slide(
+            holdout_mask_by_slide, slide_id, n_genes_local
+        )
 
         use_slide_mask = present_mask & (~holdout_mask_bool)
         if slide_means is not None and use_slide_mask.any():
             ref[:, use_slide_mask] = slide_means[:, use_slide_mask]
 
-        if holdout_mask_bool.any() and sums is not None and counts is not None:
-            excl_sums = base_ct_sums - sums
-            excl_counts = base_ct_counts - counts
-            with np.errstate(divide="ignore", invalid="ignore"):
-                excl_means = np.full_like(excl_sums, np.nan, dtype=np.float64)
-                np.divide(
-                    excl_sums,
-                    excl_counts,
-                    out=excl_means,
-                    where=excl_counts > 0,
-                )
-            excl_gene_sums = excl_sums.sum(axis=0)
-            excl_gene_counts = excl_counts.sum(axis=0)
-            with np.errstate(divide="ignore", invalid="ignore"):
-                excl_gene_mean = np.full_like(excl_gene_sums, np.nan, dtype=np.float64)
-                np.divide(
-                    excl_gene_sums,
-                    excl_gene_counts,
-                    out=excl_gene_mean,
-                    where=excl_gene_counts > 0,
-                )
-
-            hold_idx = np.where(holdout_mask_bool)[0]
-            excl_block = excl_means[:, hold_idx]
-            fallback = np.broadcast_to(excl_gene_mean[hold_idx], excl_block.shape)
-            excl_block = np.where(np.isfinite(excl_block), excl_block, fallback)
-            excl_block = np.where(np.isfinite(excl_block), excl_block, 0.0)
-            ref[:, hold_idx] = excl_block
-
-        ref = np.where(np.isfinite(ref), ref, global_ct_means)
-        ref = np.where(np.isfinite(ref), ref, np.broadcast_to(base_gene_mean, ref.shape))
-        ref = np.where(np.isfinite(ref), ref, np.broadcast_to(gene_mean_global, ref.shape))
-        ref = np.nan_to_num(ref, nan=0.0, posinf=0.0, neginf=0.0)
+        ref = _apply_holdout_fill(
+            ref,
+            holdout_mask_bool,
+            strategy=holdout_fill_strategy,
+            base_ct_sums=base_ct_sums,
+            base_ct_counts=base_ct_counts,
+            slide_sums=sums,
+            slide_counts=counts,
+        )
+        ref = _finalize_ref(
+            ref,
+            global_ct_means=global_ct_means,
+            base_gene_mean=base_gene_mean,
+            gene_mean_global=gene_mean_global,
+        )
         avgexp_df_by_slide[slide_id] = pd.DataFrame(ref, index=classes, columns=gene_names)
 
     return avgexp_df_by_slide
@@ -272,6 +430,7 @@ def build_train_region_avgexp_df_by_slide(
     fallback_df_by_slide=None,
     holdout_mask_by_slide=None,
     domain_specific: bool = False,
+    holdout_fill_strategy: str = "leave_one_slide_out",
 ):
     """
     Build per-slide avgexp priors using only cells that fall inside the effective
@@ -443,6 +602,7 @@ def build_train_region_avgexp_df_by_slide(
     avgexp_df_by_slide = {}
     fallback_df_by_slide = fallback_df_by_slide or {}
     holdout_mask_by_slide = holdout_mask_by_slide or {}
+    holdout_fill_strategy = _normalize_holdout_fill_strategy(holdout_fill_strategy)
     for src in src_list:
         slide_id = int(getattr(src, "slide_idx", -1))
         domain_id = source_domain_id(src)
@@ -453,9 +613,7 @@ def build_train_region_avgexp_df_by_slide(
                 avgexp_df_by_slide[slide_id] = fallback_df_by_slide[slide_id]
             continue
 
-        with np.errstate(divide="ignore", invalid="ignore"):
-            slide_means = np.full_like(sums, np.nan, dtype=np.float64)
-            np.divide(sums, counts, out=slide_means, where=counts > 0)
+        slide_means = _divide_or_nan(sums, counts)
 
         base_ct_sums = global_ct_sums
         base_ct_counts = global_ct_counts
@@ -469,49 +627,29 @@ def build_train_region_avgexp_df_by_slide(
 
         ref = base_ct_means.copy()
         present_mask = counts.sum(axis=0) > 0
-        holdout_mask = holdout_mask_by_slide.get(slide_id)
-        if holdout_mask is None:
-            holdout_mask_bool = np.zeros(n_genes_local, dtype=bool)
-        else:
-            holdout_mask_bool = np.asarray(holdout_mask, dtype=bool)
+        holdout_mask_bool = _holdout_mask_for_slide(
+            holdout_mask_by_slide, slide_id, n_genes_local
+        )
 
         use_slide_mask = present_mask & (~holdout_mask_bool)
         if use_slide_mask.any():
             ref[:, use_slide_mask] = slide_means[:, use_slide_mask]
 
-        if holdout_mask_bool.any():
-            excl_sums = base_ct_sums - sums
-            excl_counts = base_ct_counts - counts
-            with np.errstate(divide="ignore", invalid="ignore"):
-                excl_means = np.full_like(excl_sums, np.nan, dtype=np.float64)
-                np.divide(
-                    excl_sums,
-                    excl_counts,
-                    out=excl_means,
-                    where=excl_counts > 0,
-                )
-            excl_gene_sums = excl_sums.sum(axis=0)
-            excl_gene_counts = excl_counts.sum(axis=0)
-            with np.errstate(divide="ignore", invalid="ignore"):
-                excl_gene_mean = np.full_like(excl_gene_sums, np.nan, dtype=np.float64)
-                np.divide(
-                    excl_gene_sums,
-                    excl_gene_counts,
-                    out=excl_gene_mean,
-                    where=excl_gene_counts > 0,
-                )
-
-            hold_idx = np.where(holdout_mask_bool)[0]
-            excl_block = excl_means[:, hold_idx]
-            fallback = np.broadcast_to(excl_gene_mean[hold_idx], excl_block.shape)
-            excl_block = np.where(np.isfinite(excl_block), excl_block, fallback)
-            excl_block = np.where(np.isfinite(excl_block), excl_block, 0.0)
-            ref[:, hold_idx] = excl_block
-
-        ref = np.where(np.isfinite(ref), ref, global_ct_means)
-        ref = np.where(np.isfinite(ref), ref, np.broadcast_to(base_gene_mean, ref.shape))
-        ref = np.where(np.isfinite(ref), ref, np.broadcast_to(gene_mean_global, ref.shape))
-        ref = np.nan_to_num(ref, nan=0.0, posinf=0.0, neginf=0.0)
+        ref = _apply_holdout_fill(
+            ref,
+            holdout_mask_bool,
+            strategy=holdout_fill_strategy,
+            base_ct_sums=base_ct_sums,
+            base_ct_counts=base_ct_counts,
+            slide_sums=sums,
+            slide_counts=counts,
+        )
+        ref = _finalize_ref(
+            ref,
+            global_ct_means=global_ct_means,
+            base_gene_mean=base_gene_mean,
+            gene_mean_global=gene_mean_global,
+        )
         avgexp_df_by_slide[slide_id] = pd.DataFrame(ref, index=classes, columns=gene_names)
 
     return avgexp_df_by_slide

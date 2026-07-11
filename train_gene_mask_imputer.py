@@ -1,4 +1,4 @@
-"""Training entry point and evaluation utilities for GHIST+."""
+"""Gene-mask imputer training entry point for GHIST+."""
 
 import argparse
 import logging
@@ -8,7 +8,6 @@ import shutil
 import hashlib
 from types import SimpleNamespace
 import inspect
-import json
 
 import torch
 import torch.nn as nn
@@ -19,8 +18,7 @@ import pandas as pd
 import numpy as np
 import natsort
 
-import dataio.dataset_input_tma_select as dataset_input_tma_base
-import dataio.dataset_input_union_tma_select as dataset_input_tma
+import dataio.dataset_input_union as dataset_input
 import dataio.references as reference_utils
 import dataio.samplers as sampler_utils
 import dataio.spatial as spatial_utils
@@ -29,469 +27,17 @@ import model.framework as model_framework
 import model.graph as graph_utils
 import model.panel_completion as panel_completion
 import utils.evaluation as evaluation_utils
+import utils.gene_mask_imputer as imputer_task
 import utils.metrics as metric_utils
 import utils.utils as utils
 
 
-def _to_namespace(obj):
-    if obj is None:
-        return None
-    if isinstance(obj, SimpleNamespace):
-        return obj
-    if isinstance(obj, dict):
-        return SimpleNamespace(**{k: _to_namespace(v) for k, v in obj.items()})
-    if isinstance(obj, list):
-        return [_to_namespace(v) for v in obj]
-    if isinstance(obj, tuple):
-        if hasattr(obj, "_asdict"):
-            return _to_namespace(obj._asdict())
-        return tuple(_to_namespace(v) for v in obj)
-    return obj
-
-
-def _to_serialisable(obj):
-    if isinstance(obj, SimpleNamespace):
-        return {k: _to_serialisable(v) for k, v in vars(obj).items()}
-    if isinstance(obj, dict):
-        return {str(k): _to_serialisable(v) for k, v in obj.items()}
-    if isinstance(obj, list):
-        return [_to_serialisable(v) for v in obj]
-    if isinstance(obj, tuple):
-        return [_to_serialisable(v) for v in obj]
-    if isinstance(obj, (np.floating, np.integer)):
-        return obj.item()
-    return obj
-
-
-def _write_json(path: str, payload: dict):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(payload, f, indent=2, sort_keys=True)
-
-
-def _punch_cache_path(base_dir: str, slide_idx: int) -> str:
-    return os.path.join(base_dir, f"punch_slide{int(slide_idx)}.pt")
-
-
-def _as_float_attr(obj, names, default):
-    for name in names:
-        try:
-            val = getattr(obj, name)
-        except Exception:
-            continue
-        if val is not None:
-            try:
-                return float(val)
-            except (TypeError, ValueError):
-                pass
-    return float(default)
-
-
-# TMA punch preselection
-def preselect_tma_punch_with_vq(
-    model,
-    src,
-    opts,
-    train_regions,
-    fold_id: int,
-    experiment_path: str,
-    device,
-    expr_ref_torch,
-    expr_ref_torch_map,
-    gene_names,
-    classes,
-    *,
-    graph_k: int = 6,
-):
-    """
-    Select one training ROI/punch per slide using the old VQ ROI logic.
-
-    This is only used by train_tma_select.py. It scans the unfiltered training
-    patches, scores candidate windows by VQ-code balance/coverage/size, then
-    optionally re-ranks top candidates with cell-type and molecular diversity.
-    """
-    enabled = bool(
-        getattr(opts.data, "punch_select_enabled", True)
-        or getattr(opts.data, "tma_select_enabled", True)
-    )
-    if not enabled:
-        return
-
-    src = _to_namespace(src)
-    slide_idx = int(getattr(src, "slide_idx", -1))
-    cache_path = _punch_cache_path(experiment_path, slide_idx)
-    force = bool(getattr(opts.data, "punch_force_reselect", False))
-    if os.path.isfile(cache_path) and not force:
-        logging.info("[punch] Using cached punch selection for slide=%s: %s", slide_idx, cache_path)
-        return
-
-    window_um = _as_float_attr(opts.data, ("broadcast_window_um", "roi_size_um"), 1000.0)
-    pixel_um = _as_float_attr(opts.data, ("pixel_size_um",), _as_float_attr(opts.model, ("pixel_size_um",), 0.2125))
-    if window_um <= 0 or pixel_um <= 0:
-        logging.warning(
-            "[punch] Invalid window_um=%.3f pixel_um=%.5f; skipping slide=%s",
-            window_um,
-            pixel_um,
-            slide_idx,
-        )
-        return
-    window_px = window_um / pixel_um
-
-    opts_stain_norm = opts.stain_norm
-    if hasattr(opts_stain_norm, "fp_norm_ref") and isinstance(opts_stain_norm.fp_norm_ref, (list, tuple)):
-        opts_stain_norm = SimpleNamespace(**vars(opts_stain_norm))
-        opts_stain_norm.fp_norm_ref = opts_stain_norm.fp_norm_ref[0]
-
-    logging.info("[punch] Preselecting TMA punch via VQ for slide=%s", slide_idx)
-    ds = dataset_input_tma_base.DataProcessing(
-        src,
-        opts.data,
-        train_regions,
-        opts.comps,
-        opts_stain_norm,
-        classes,
-        gene_names,
-        device,
-        experiment_path,
-        False,
-        fold_id,
-        mode="train",
-        immune_sampler_boost=1.0,
-        immune_class_multipliers=None,
-        return_coords=True,
-        force_no_punch_filter=True,
-    )
-    if getattr(ds, "tfs_test", None) is not None:
-        ds.tfs = ds.tfs_test
-
-    num_workers = int(getattr(opts.data, "punch_num_workers", 0))
-    dl = DataLoader(
-        dataset=ds,
-        batch_size=max(1, int(getattr(opts.training, "batch_size", 1))),
-        shuffle=False,
-        num_workers=num_workers,
-        drop_last=False,
-        pin_memory=getattr(opts.data, "pin_memory", False),
-    )
-
-    coords_all = []
-    vq_err_all = []
-    vq_idx_all = []
-    n_cells_all = []
-    expr_sum_all = []
-    ct_counts_all = []
-    expr_mean_all = []
-
-    was_training = model.training
-    model.eval()
-    with torch.no_grad():
-        for (
-            batch_nuclei,
-            batch_type_patch,
-            batch_he_img,
-            batch_expr,
-            batch_n_cells,
-            batch_ct,
-            patch_ids,
-            patch_coords,
-            patch_slide_idx,
-        ) in dl:
-            batch_nuclei = batch_nuclei.to(device)
-            batch_he_img = batch_he_img.to(device)
-            batch_expr = batch_expr.to(device)
-            batch_n_cells = batch_n_cells.to(device)
-            batch_ct = batch_ct.to(device)
-            patch_ids = patch_ids.to(device)
-            patch_coords = patch_coords.to(device)
-            patch_slide_idx = patch_slide_idx.to(device)
-
-            model_extra_kwargs = {}
-            if getattr(model, "use_ecrm", False):
-                graph = graph_utils.build_cell_graph(
-                    batch_nuclei,
-                    patch_ids,
-                    k_neighbors=max(int(graph_k), 2),
-                )
-                model_extra_kwargs = {
-                    "coords_cells": graph.coords,
-                    "cell_edge_index": graph.edge_index,
-                    "cell_patch_ids": graph.patch_index,
-                }
-            expr_ref_batch = (
-                expr_ref_torch_map.get(slide_idx, expr_ref_torch)
-                if isinstance(expr_ref_torch_map, dict)
-                else expr_ref_torch
-            )
-            model(
-                batch_he_img,
-                batch_nuclei,
-                batch_n_cells,
-                expr_ref_batch,
-                batch_ct,
-                batch_expr,
-                patch_ids=patch_ids,
-                **model_extra_kwargs,
-            )
-
-            aux = getattr(model, "last_aux_losses", {}) or {}
-            vq_err = aux.get("vq_patch_err")
-            vq_idx = aux.get("vq_patch_idx")
-
-            coords_np = patch_coords.detach().cpu().numpy().astype(np.float32)
-            slides_np = patch_slide_idx.detach().cpu().numpy().astype(np.int64)
-            n_cells_np = batch_n_cells.detach().cpu().numpy().reshape(-1).astype(np.int64)
-            expr_sum_np = batch_expr.detach().sum(dim=(1, 2)).cpu().numpy().astype(np.float32)
-
-            keep = slides_np == slide_idx
-            if not np.any(keep):
-                continue
-            coords_all.append(coords_np[keep])
-            n_cells_all.append(n_cells_np[keep])
-            expr_sum_all.append(expr_sum_np[keep])
-            if vq_err is not None and isinstance(vq_err, torch.Tensor) and vq_err.numel() > 0:
-                vq_err_all.append(vq_err.detach().cpu().numpy()[keep])
-            if vq_idx is not None and isinstance(vq_idx, torch.Tensor) and vq_idx.numel() > 0:
-                vq_idx_all.append(vq_idx.detach().cpu().numpy()[keep])
-
-            n_classes = int(len(classes)) if classes is not None else 0
-            if n_classes > 0 and batch_ct is not None and batch_expr is not None:
-                max_cells = int(batch_ct.shape[1])
-                n_cells_vec = batch_n_cells.view(-1).long().to(device)
-                mask_cells = torch.arange(max_cells, device=device).unsqueeze(0) < n_cells_vec.unsqueeze(1)
-                ct_onehot = F.one_hot(batch_ct.clamp_min(0), num_classes=n_classes).float()
-                ct_onehot = ct_onehot * mask_cells.unsqueeze(-1).float()
-                ct_counts_all.append(ct_onehot.sum(dim=1).detach().cpu().numpy()[keep])
-
-                mask_float = mask_cells.unsqueeze(-1).to(batch_expr.dtype)
-                expr_sum_genes = (batch_expr * mask_float).sum(dim=1)
-                denom = n_cells_vec.clamp_min(1).to(batch_expr.dtype).unsqueeze(1)
-                expr_mean_all.append((expr_sum_genes / denom).detach().cpu().numpy()[keep])
-
-    if was_training:
-        model.train()
-
-    if not coords_all:
-        logging.warning("[punch] No patches found for slide=%s; keeping full slide.", slide_idx)
-        return
-
-    coords_all = np.concatenate(coords_all, axis=0).astype(np.float32)
-    n_cells_all = np.concatenate(n_cells_all, axis=0).astype(np.int64)
-    expr_sum_all = np.concatenate(expr_sum_all, axis=0).astype(np.float32)
-    vq_err_all = np.concatenate(vq_err_all, axis=0).astype(np.float32) if vq_err_all else None
-    vq_idx_all = np.concatenate(vq_idx_all, axis=0).astype(np.int64) if vq_idx_all else None
-    ct_counts_all = np.concatenate(ct_counts_all, axis=0).astype(np.int64) if ct_counts_all else None
-    expr_mean_all = np.concatenate(expr_mean_all, axis=0).astype(np.float32) if expr_mean_all else None
-
-    qc_min_cells = int(getattr(opts.data, "punch_qc_min_cells", getattr(opts.data, "broadcast_min_cells", 1)))
-    qc_min_expr_sum = float(getattr(opts.data, "punch_qc_min_expr_sum", 0.0))
-    qc_mask = (n_cells_all >= qc_min_cells) & (expr_sum_all > qc_min_expr_sum)
-    n_qc_total = int(qc_mask.sum())
-    if n_qc_total <= 0:
-        logging.warning("[punch] No QC patches for slide=%s; falling back to minimum VQ error.", slide_idx)
-        if vq_err_all is None or vq_err_all.size == 0:
-            return
-        best_coord = coords_all[int(np.argmin(vq_err_all))]
-        best_meta = {"fallback": "min_vq_err_no_qc"}
-    elif vq_idx_all is None or vq_idx_all.size == 0:
-        logging.warning("[punch] VQ indices unavailable for slide=%s; falling back to minimum VQ error.", slide_idx)
-        if vq_err_all is None or vq_err_all.size == 0:
-            return
-        idx = np.where(qc_mask)[0]
-        best_coord = coords_all[idx[int(np.argmin(vq_err_all[idx]))]]
-        best_meta = {"fallback": "min_vq_err_no_idx"}
-    else:
-        vq_cfg = getattr(opts.model, "vq_patch", None)
-        k_clusters = int(getattr(vq_cfg, "n_codes", 0)) if vq_cfg is not None else 0
-        k_clusters = max(k_clusters, int(vq_idx_all.max()) + 1, 2)
-        roi_balance_target = str(getattr(opts.data, "punch_roi_balance_target", "uniform")).strip().lower()
-        if roi_balance_target == "slide":
-            counts_slide = np.bincount(vq_idx_all[qc_mask], minlength=k_clusters).astype(np.float32)
-            target = (
-                counts_slide / counts_slide.sum()
-                if counts_slide.sum() > 0
-                else np.full((k_clusters,), 1.0 / k_clusters, dtype=np.float32)
-            )
-        else:
-            target = np.full((k_clusters,), 1.0 / k_clusters, dtype=np.float32)
-
-        half = 0.5 * float(window_px)
-        pool_coords = coords_all[qc_mask]
-        roi_area = float(window_px * window_px)
-        wsi_area = float(
-            (coords_all[:, 0].max() - coords_all[:, 0].min() + 1.0)
-            * (coords_all[:, 1].max() - coords_all[:, 1].min() + 1.0)
-        )
-        sampling_factor = float(getattr(opts.data, "punch_sampling_factor", 500.0))
-        num_samples = int(sampling_factor * wsi_area / max(roi_area, 1.0))
-        num_samples = int(getattr(opts.data, "punch_num_samples", num_samples))
-        num_samples = max(int(getattr(opts.data, "punch_min_samples", 200)), num_samples)
-        num_samples = min(int(getattr(opts.data, "punch_max_samples", 5000)), num_samples, int(pool_coords.shape[0]))
-        num_samples = max(num_samples, 1)
-        seed = int(getattr(opts.training, "seed", getattr(opts.training, "batch_sampler_seed", 0)))
-        rng = np.random.default_rng(seed + 10007 * max(slide_idx, 0))
-        cand_idx = rng.choice(pool_coords.shape[0], size=num_samples, replace=pool_coords.shape[0] < num_samples)
-        cand_centers = pool_coords[cand_idx]
-
-        roi_w_balance = float(getattr(opts.data, "punch_roi_w_balance", 1.0))
-        roi_w_coverage = float(getattr(opts.data, "punch_roi_w_coverage", 1.0))
-        roi_w_size = float(getattr(opts.data, "punch_roi_w_size", 1.0))
-        roi_min_qc = int(getattr(opts.data, "punch_roi_min_qc", 1))
-        candidates = []
-        for center in cand_centers:
-            in_mask = (np.abs(coords_all[:, 0] - center[0]) <= half) & (np.abs(coords_all[:, 1] - center[1]) <= half)
-            n_total = int(in_mask.sum())
-            if n_total <= 0:
-                continue
-            qc_in = in_mask & qc_mask
-            n_qc = int(qc_in.sum())
-            if n_qc < roi_min_qc:
-                continue
-            coverage = float(np.sqrt(n_qc / max(n_total, 1)))
-            size_score = float(1.0 / (1.0 + np.exp(-2.0 * (n_qc / max(n_qc_total, 1)))))
-            counts = np.bincount(vq_idx_all[qc_in], minlength=k_clusters).astype(np.float32)
-            if counts.sum() <= 0:
-                balance = 0.0
-            else:
-                p = counts / counts.sum()
-                balance = float(np.dot(p, target) / (np.linalg.norm(p) * np.linalg.norm(target) + 1e-8))
-            score = (balance ** roi_w_balance) * (coverage ** roi_w_coverage) * (size_score ** roi_w_size)
-            candidates.append(
-                {
-                    "center": center,
-                    "stage1_score": float(score),
-                    "balance": float(balance),
-                    "coverage": float(coverage),
-                    "size": float(size_score),
-                    "n_qc_patches": int(n_qc),
-                    "n_total_patches": int(n_total),
-                }
-            )
-        if not candidates:
-            logging.warning("[punch] ROI candidate sampling produced no valid windows for slide=%s.", slide_idx)
-            return
-
-        candidates.sort(key=lambda d: d["stage1_score"], reverse=True)
-        best = candidates[0]
-        best_coord = best["center"]
-        best_meta = dict(best)
-        best_meta.pop("center", None)
-
-        if ct_counts_all is not None and expr_mean_all is not None:
-            stage2_topk = max(1, int(getattr(opts.data, "punch_stage2_topk", 25)))
-            stage2_min_ratio = float(
-                np.clip(
-                    float(getattr(opts.data, "punch_stage2_min_stage1_ratio", 0.98)),
-                    0.0,
-                    1.0,
-                )
-            )
-            subset = [c for c in candidates if c["stage1_score"] >= best["stage1_score"] * stage2_min_ratio]
-            subset = subset[:stage2_topk] if len(subset) >= stage2_topk else candidates[:stage2_topk]
-
-            n_classes = int(ct_counts_all.shape[1])
-            keep_ct = np.ones((n_classes,), dtype=bool)
-            if bool(getattr(opts.data, "punch_stage2_exclude_unassigned", True)) and classes:
-                for idx_cls, name in enumerate(classes):
-                    if str(name).strip().lower() == "unassigned":
-                        keep_ct[idx_cls] = False
-                        break
-            slide_ct = ct_counts_all[qc_mask].sum(axis=0).astype(np.float32)[keep_ct]
-            p_slide = (
-                slide_ct / slide_ct.sum()
-                if slide_ct.sum() > 0
-                else np.full(
-                    (keep_ct.sum(),),
-                    1.0 / max(int(keep_ct.sum()), 1),
-                    dtype=np.float32,
-                )
-            )
-            p_uniform = np.full_like(p_slide, 1.0 / max(p_slide.size, 1))
-            alpha = float(np.clip(float(getattr(opts.data, "punch_stage2_ct_blend_alpha", 0.5)), 0.0, 1.0))
-            p_target = (1.0 - alpha) * p_slide + alpha * p_uniform
-            slide_cells_total = max(int(n_cells_all[qc_mask].sum()), 1)
-
-            def _cosine(a, b):
-                return float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-8))
-
-            def _mol_rank(X, w):
-                min_patches = int(getattr(opts.data, "punch_stage2_min_patches_for_mol", 8))
-                if X.shape[0] < min_patches:
-                    return 0.0
-                w = w.astype(np.float64)
-                w_sum = float(w.sum())
-                if w_sum <= 0:
-                    return 0.0
-                X = X.astype(np.float64)
-                mu = (X * w[:, None]).sum(axis=0) / w_sum
-                Xc = X - mu
-                cov = (Xc * w[:, None]).T @ Xc / w_sum
-                cov.flat[:: cov.shape[0] + 1] += float(getattr(opts.data, "punch_stage2_mol_ridge", 1e-4))
-                eig = np.clip(np.linalg.eigvalsh(cov), 0.0, None)
-                s = float(eig.sum())
-                if s <= 0:
-                    return 0.0
-                p = eig / s
-                return float(np.clip(np.exp(-np.sum(p * np.log(p + 1e-12))) / max(X.shape[1], 1), 0.0, 1.0))
-
-            stage2_w_ct = float(getattr(opts.data, "punch_stage2_w_ct", 1.0))
-            stage2_w_cells = float(getattr(opts.data, "punch_stage2_w_cells", 1.0))
-            stage2_w_mol = float(getattr(opts.data, "punch_stage2_w_mol", 1.0))
-            best_stage2 = None
-            best_stage2_score = -1.0
-            for cand in subset:
-                center = cand["center"]
-                in_mask = (
-                    (np.abs(coords_all[:, 0] - center[0]) <= half)
-                    & (np.abs(coords_all[:, 1] - center[1]) <= half)
-                )
-                qc_in = in_mask & qc_mask
-                if not np.any(qc_in):
-                    continue
-                cells_roi = int(n_cells_all[qc_in].sum())
-                if cells_roi < int(getattr(opts.data, "punch_stage2_min_cells", 1)):
-                    continue
-                ct_roi = ct_counts_all[qc_in].sum(axis=0).astype(np.float32)[keep_ct]
-                s_ct = _cosine(ct_roi / ct_roi.sum(), p_target) if ct_roi.sum() > 0 else 0.0
-                s_ct = float(np.clip(s_ct, 0.0, 1.0))
-                s_cells = float(1.0 / (1.0 + np.exp(-2.0 * (cells_roi / float(slide_cells_total)))))
-                s_mol = _mol_rank(expr_mean_all[qc_in], n_cells_all[qc_in].astype(np.float32))
-                score = (s_ct ** stage2_w_ct) * (s_cells ** stage2_w_cells) * (s_mol ** stage2_w_mol)
-                cand.update(
-                    {
-                        "stage2_score": float(score),
-                        "stage2_ct": float(s_ct),
-                        "stage2_cells": float(s_cells),
-                        "stage2_mol": float(s_mol),
-                        "stage2_cells_roi": int(cells_roi),
-                    }
-                )
-                if score > best_stage2_score:
-                    best_stage2_score = float(score)
-                    best_stage2 = cand
-            if best_stage2 is not None:
-                best_coord = best_stage2["center"]
-                best_meta = dict(best_stage2)
-                best_meta.pop("center", None)
-
-    meta = {
-        "punch_center": [float(best_coord[0]), float(best_coord[1])],
-        "window_px": float(window_px),
-        "punch_select_method": "vq_roi_score_twostage",
-        "slide_idx": int(slide_idx),
-        **best_meta,
-    }
-    torch.save(meta, cache_path)
-    logging.info(
-        "[punch] Selected slide=%s center=%s window_px=%.1f -> %s",
-        slide_idx,
-        meta["punch_center"],
-        window_px,
-        cache_path,
-    )
+TASK_NAME = imputer_task.TASK_NAME
+TASK_DESCRIPTION = imputer_task.TASK_DESCRIPTION
 
 
 def main(config):
-    opts = _to_namespace(utils.json_file_to_pyobj(config.config_file))
+    opts = imputer_task.to_namespace(utils.json_file_to_pyobj(config.config_file))
     torch.autograd.set_detect_anomaly(False)
 
     logging.basicConfig(
@@ -500,18 +46,15 @@ def main(config):
         stream=sys.stdout,
     )
     device = utils.get_device(config.gpu_id)
+    logging.info("Task: %s - %s", TASK_NAME, TASK_DESCRIPTION)
 
-    # Runtime configuration
-    eval_cfg = _to_namespace(getattr(opts, "evaluation", None)) or SimpleNamespace()
-    if hasattr(opts, "data") and opts.data is not None:
-        if not hasattr(opts.data, "punch_select_enabled"):
-            opts.data.punch_select_enabled = True
-        if not hasattr(opts.data, "punch_filter_splits"):
-            opts.data.punch_filter_splits = "train"
-        if not hasattr(opts.data, "roi_size_um") and not hasattr(opts.data, "broadcast_window_um"):
-            opts.data.roi_size_um = 1000.0
-        if not hasattr(opts.data, "pixel_size_um"):
-            opts.data.pixel_size_um = 0.2125
+    repo_root = os.path.dirname(os.path.abspath(__file__))
+    eval_cfg = imputer_task.to_namespace(getattr(opts, "evaluation", None)) or SimpleNamespace()
+    imputer_cfg_resolved = imputer_task.resolve_config(
+        getattr(opts, "gene_mask_imputer", None),
+        repo_root=repo_root,
+    )
+    imputer_task.log_config(imputer_cfg_resolved)
 
     if not hasattr(opts, "model") or opts.model is None:
         opts.model = SimpleNamespace()
@@ -635,15 +178,17 @@ def main(config):
     else:
         experiment_path = os.path.join(default_results_dir, timestamp)
 
-    per_gene_dir = os.path.join(experiment_path, "per_gene_pearson")
     os.makedirs(experiment_path + "/" + opts.experiment_dirs.model_dir, exist_ok=True)
-    os.makedirs(per_gene_dir, exist_ok=True)
 
     shutil.copyfile(
         config.config_file, experiment_path + "/" + os.path.basename(config.config_file)
     )
 
     run_meta = {
+        "task_name": TASK_NAME,
+        "task_description": TASK_DESCRIPTION,
+        "entrypoint": os.path.basename(__file__),
+        "gene_mask_imputer": imputer_cfg_resolved,
         "config_file": os.path.abspath(config.config_file),
         "fold_id": int(config.fold_id),
         "gpu_id": int(config.gpu_id),
@@ -656,9 +201,9 @@ def main(config):
             "use_gt_ct_ref_weights": False,
             "ecrm_use_gt_ct": False,
         },
-        "evaluation": _to_serialisable(eval_cfg),
+        "evaluation": imputer_task.to_serialisable(eval_cfg),
     }
-    _write_json(os.path.join(metrics_dir, "run_meta.json"), run_meta)
+    imputer_task.write_json(os.path.join(metrics_dir, "run_meta.json"), run_meta)
 
     # Model and source setup
     logging.info("Initialising model")
@@ -699,9 +244,9 @@ def main(config):
         if not isinstance(sources, (list, tuple)):
             sources = [sources]
         return [
-            _to_namespace(utils.json_file_to_pyobj(src))
+            imputer_task.to_namespace(utils.json_file_to_pyobj(src))
             if isinstance(src, str)
-            else _to_namespace(src)
+            else imputer_task.to_namespace(src)
             for src in sources
         ]
 
@@ -736,25 +281,40 @@ def main(config):
 
     # Holdout and panel-completion settings
     holdout_n_genes = int(getattr(opts.training, "holdout_n_genes", 20))
-    holdout_seed = int(getattr(opts.training, "holdout_seed", 0))
     if holdout_n_genes < 0:
         holdout_n_genes = 0
 
-    holdout_n_genes_eval = 0
-    logging.info("Holdout eval disabled; training uses all measured genes.")
+    holdout_n_genes_eval = (
+        int(imputer_cfg_resolved["mask_n_genes"])
+        if imputer_cfg_resolved["enabled"]
+        else 0
+    )
+    if holdout_n_genes_eval > 0:
+        logging.info(
+            "Holdout eval enabled: masking top %d SVG genes per slide for validation-only imputation targets.",
+            holdout_n_genes_eval,
+        )
+    else:
+        logging.info("Holdout eval disabled; training uses all measured genes.")
 
+    panel_hide_default = (
+        float(imputer_cfg_resolved["random_mask_frac"])
+        if imputer_cfg_resolved["enabled"]
+        else (0.30 if holdout_n_genes > 0 else 0.0)
+    )
     panel_hide_frac = float(
         getattr(
             opts.training,
             "panel_hide_frac",
-            0.30 if holdout_n_genes > 0 else 0.0,
+            panel_hide_default,
         )
     )
     panel_use_natural_missing = bool(
         getattr(opts.training, "panel_use_natural_missing", False)
     )
     panel_completion_enabled = bool(
-        (holdout_n_genes > 0)
+        imputer_cfg_resolved["enabled"]
+        or (holdout_n_genes > 0)
         or (panel_hide_frac > 0.0)
         or panel_use_natural_missing
     )
@@ -767,9 +327,9 @@ def main(config):
     )
     panel_hidden_dim = 256
     panel_dropout = 0.0
-    panel_use_morph = True
+    panel_use_morph = bool(imputer_cfg_resolved["use_morph"])
     panel_detach_morph = False
-    panel_copy_observed = True
+    panel_copy_observed = bool(imputer_cfg_resolved["copy_observed"])
     panel_train_on_holdout = False
     panel_hide_in_forward = False
     panel_morph_gate_init = -2.0
@@ -809,150 +369,22 @@ def main(config):
     else:
         baseline_torch = None
 
-    holdout_genes_by_slide = {}
-    holdout_mask_by_slide = {}
+    holdout_genes_by_slide, holdout_mask_by_slide, holdout_hash = (
+        imputer_task.prepare_holdout_masks(
+            sources_trainval=sources_trainval,
+            expr_per_source=expr_per_source,
+            gene_names=gene_names,
+            mask_n=holdout_n_genes_eval,
+            cfg=imputer_cfg_resolved,
+            fold_id=config.fold_id,
+            experiment_path=experiment_path,
+            metrics_dir=metrics_dir,
+            spatial_utils=spatial_utils,
+        )
+    )
 
     ct_series_map = {}
     if use_celltype:
-        if holdout_n_genes_eval > 0:
-            def _svg_scores_for_slide(src, df_expr_local, present_genes):
-                """
-                Approximate Giotto-style SVG ranking via Moran's I on a kNN graph.
-
-                Uses a downsampled nuclei segmentation label map if available
-                (he_image_nuclei_seg_microns.tif in the same folder as fp_nuc_seg).
-                Returns Moran scores aligned to present_genes, or None if unavailable.
-                """
-                try:
-                    fp_seg = getattr(src, "fp_nuc_seg", None)
-                    if not fp_seg:
-                        return None
-                    fp_microns = os.path.join(
-                        os.path.dirname(fp_seg), "he_image_nuclei_seg_microns.tif"
-                    )
-                    if not os.path.isfile(fp_microns):
-                        return None
-
-                    cell_ids_all = df_expr_local.index.to_numpy(dtype=np.int64)
-                    if cell_ids_all.size == 0:
-                        return None
-
-                    rng = np.random.default_rng(
-                        holdout_seed
-                        + int(getattr(src, "slide_idx", 0)) * 10007
-                        + int(getattr(src, "domain_id", 0)) * 1009
-                    )
-                    sample_cap = min(3000, cell_ids_all.size)
-                    sample_ids = (
-                        rng.choice(cell_ids_all, size=sample_cap, replace=False)
-                        if sample_cap < cell_ids_all.size
-                        else cell_ids_all
-                    )
-                    kept_ids, coords_yx = spatial_utils.centroids_from_label_image(
-                        fp_microns, sample_ids, chunk_rows=256
-                    )
-                    if kept_ids.size < 100:
-                        return None
-
-                    expr_counts = df_expr_local.loc[kept_ids, present_genes].to_numpy(
-                        dtype=np.float32, copy=False
-                    )
-                    expr_model = np.log1p(np.clip(expr_counts, 0.0, None)) * float(
-                        opts.data.expr_scale
-                    )
-                    return metric_utils.morans_many(expr_model, coords_yx, k=8)
-                except Exception as exc:
-                    logging.warning(
-                        "SVG Moran ranking failed for slide %s: %s",
-                        getattr(src, "slide_idx", "na"),
-                        exc,
-                    )
-                    return None
-
-            for src in sources_trainval:
-                df_expr_tmp = expr_per_source[src.fp_expr]
-                present = [g for g in df_expr_tmp.columns.tolist() if g in gene_names]
-                if not present:
-                    continue
-                ct_series_tmp = reference_utils.load_ct_series_for_classes(
-                    getattr(src, "fp_cell_type", None), classes
-                )
-                idx = (
-                    df_expr_tmp.index.intersection(ct_series_tmp.index)
-                    if ct_series_tmp is not None
-                    else df_expr_tmp.index
-                )
-                if idx.empty:
-                    continue
-                expr_arr = df_expr_tmp.loc[idx, present].to_numpy(dtype=np.float64)
-                expr_target = np.log1p(np.clip(expr_arr, 0.0, None)) * float(
-                    opts.data.expr_scale
-                )
-                var = np.var(expr_target, axis=0)
-                nonzero = (expr_arr > 0).sum(axis=0)
-
-                n_cells = int(expr_arr.shape[0])
-                min_nonzero = max(5, int(0.05 * n_cells))
-                cand_mask = (var > 0.0) & (nonzero >= min_nonzero)
-                if int(cand_mask.sum()) < holdout_n_genes_eval:
-                    min_nonzero = max(5, int(0.01 * n_cells))
-                    cand_mask = (var > 0.0) & (nonzero >= min_nonzero)
-                if int(cand_mask.sum()) < holdout_n_genes_eval:
-                    cand_mask = (var > 0.0) & (nonzero > 0)
-                    min_nonzero = int(nonzero[cand_mask].min()) if int(cand_mask.sum()) else 0
-
-                svg_scores = _svg_scores_for_slide(src, df_expr_tmp, present)
-                chosen = []
-                if svg_scores is not None and len(svg_scores) == len(present):
-                    order = np.argsort(-svg_scores)
-                    for j in order:
-                        if cand_mask[j]:
-                            chosen.append(present[int(j)])
-                            if len(chosen) >= holdout_n_genes_eval:
-                                break
-                    if len(chosen) < holdout_n_genes_eval:
-                        for j in order:
-                            g = present[int(j)]
-                            if g not in chosen:
-                                chosen.append(g)
-                                if len(chosen) >= holdout_n_genes_eval:
-                                    break
-                else:
-                    order = np.argsort(-var)
-                    for j in order:
-                        if cand_mask[j]:
-                            chosen.append(present[int(j)])
-                            if len(chosen) >= holdout_n_genes_eval:
-                                break
-                    if len(chosen) < holdout_n_genes_eval:
-                        for j in order:
-                            g = present[int(j)]
-                            if g not in chosen:
-                                chosen.append(g)
-                                if len(chosen) >= holdout_n_genes_eval:
-                                    break
-
-                chosen = [str(g) for g in chosen[:holdout_n_genes_eval]]
-                chosen = sorted(set(chosen), key=lambda x: gene_names.index(x))
-                slide_id = int(getattr(src, "slide_idx", -1))
-                holdout_genes_by_slide[slide_id] = chosen
-                m = np.zeros(len(gene_names), dtype=np.float32)
-                for g in chosen:
-                    m[gene_names.index(g)] = 1.0
-                holdout_mask_by_slide[slide_id] = m
-                logging.info(
-                    "Holdout slide %s: %d genes (top_SVG=True min_nonzero=%d seed=%d)",
-                    slide_id,
-                    len(chosen),
-                    min_nonzero,
-                    holdout_seed,
-                )
-                logging.info(
-                    "Holdout genes slide %s: %s",
-                    slide_id,
-                    ", ".join(chosen),
-                )
-
         for src in all_sources:
             ct_series_tmp = reference_utils.load_ct_series_for_classes(
                 getattr(src, "fp_cell_type", None), classes
@@ -962,6 +394,9 @@ def main(config):
             ct_series_map[getattr(src, "fp_expr", "")] = ct_series_tmp
 
     avgexp_df_by_slide = {}
+    avgexp_holdout_fill_strategy = imputer_task.avgexp_holdout_fill_strategy(
+        imputer_cfg_resolved
+    )
     if use_avgexp and use_celltype and classes:
         avgexp_df_by_slide = reference_utils.build_train_region_avgexp_df_by_slide(
             sources_trainval,
@@ -972,6 +407,7 @@ def main(config):
             float(opts.data.expr_scale),
             holdout_mask_by_slide=holdout_mask_by_slide,
             domain_specific=avgexp_domain_specific,
+            holdout_fill_strategy=avgexp_holdout_fill_strategy,
         )
         missing_trainval_refs = [
             int(getattr(src, "slide_idx", -1))
@@ -995,9 +431,10 @@ def main(config):
 
     # Imputation cache
     gene_union_hash = hashlib.md5(",".join(gene_names).encode("utf-8")).hexdigest()[:8]
-    impute_dir = os.path.join(
-        cache_root, f"imputed_trainregionfb_f{config.fold_id}_{gene_union_hash}"
-    )
+    impute_tag = f"imputed_trainregionfb_f{config.fold_id}_{gene_union_hash}"
+    if holdout_n_genes_eval > 0:
+        impute_tag = f"{impute_tag}_topgiotto{holdout_n_genes_eval}_{holdout_hash}"
+    impute_dir = os.path.join(cache_root, impute_tag)
     os.makedirs(impute_dir, exist_ok=True)
     force_reimpute = str(os.environ.get("FORCE_REIMPUTE", "0")).strip().lower() in {
         "1",
@@ -1255,44 +692,9 @@ def main(config):
     except Exception:
         supports_cell_graph = False
     logging.info("Cell-graph support: %s", supports_cell_graph)
-    model.to(device)
 
-    # Datasets, TMA selection, and loaders
+    # Datasets and loaders
     logging.info("Preparing data")
-
-    punch_enabled = bool(
-        getattr(opts.data, "punch_select_enabled", False)
-        or getattr(opts.data, "tma_select_enabled", False)
-    )
-    if punch_enabled:
-        ecrm_cfg_punch = getattr(opts.model, "ecrm", None)
-        punch_graph_k = (
-            int(getattr(ecrm_cfg_punch, "graph_k", getattr(ecrm_cfg_punch, "k_target", 8)))
-            if ecrm_cfg_punch is not None
-            else 8
-        )
-        for src in train_sources:
-            try:
-                preselect_tma_punch_with_vq(
-                    model,
-                    src,
-                    opts,
-                    train_regions,
-                    config.fold_id,
-                    experiment_path,
-                    device,
-                    expr_ref_torch,
-                    expr_ref_torch_map,
-                    gene_names,
-                    classes,
-                    graph_k=punch_graph_k,
-                )
-            except Exception as exc:
-                logging.warning(
-                    "[punch] VQ TMA preselection failed for slide=%s: %s",
-                    getattr(src, "slide_idx", "unknown"),
-                    exc,
-                )
 
     expr_ref_torch_val = expr_ref_torch
     expr_ref_torch_val_map = expr_ref_torch_map
@@ -1332,7 +734,7 @@ def main(config):
     train_datasets = []
     for src in train_sources:
         src_ns = src if isinstance(src, SimpleNamespace) else SimpleNamespace(**src)
-        ds = dataset_input_tma.DataProcessingUnion(
+        ds = dataset_input.DataProcessingUnion(
             src_ns,
             opts.data,
             train_regions,
@@ -1546,7 +948,7 @@ def main(config):
         datasets = []
         for src in src_list:
             src_ns = src if isinstance(src, SimpleNamespace) else SimpleNamespace(**src)
-            ds = dataset_input_tma.DataProcessingUnion(
+            ds = dataset_input.DataProcessingUnion(
                 src_ns,
                 opts.data,
                 regions,
@@ -1692,7 +1094,7 @@ def main(config):
             optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
             logging.info("Loaded %s", load_path)
         except:
-            logging.warning("Optimizer state dict not found")
+            logging.info("Optimizer state dict not found")
 
     else:
         model.to(device)
@@ -1722,9 +1124,11 @@ def main(config):
     )
     logits_loss_weight = float(getattr(opts.training, "logits_loss_weight", 1.0))
     logging.info(
-        "Loss setup: expr_ct_embed_w=%.3f "
-        "logits_w=%.3f expr_ct_embed_internal=100 "
-        "interleave_slide_batches=%s",
+        (
+            "Loss setup: expr_ct_embed_w=%.3f "
+            "logits_w=%.3f expr_ct_embed_internal=100 "
+            "interleave_slide_batches=%s"
+        ),
         expr_ct_embed_loss_weight,
         logits_loss_weight,
         str(bool(getattr(opts.training, "interleave_slide_batches", True))),
@@ -1766,17 +1170,15 @@ def main(config):
     best_metric_eps = float(getattr(eval_cfg, "best_metric_eps", 1e-8))
     external_source_tag = str(getattr(eval_cfg, "external_source", "data_sources_test"))
 
-    epoch_records = []
-    best_val_gene_pooled = -float("inf")
+    best_selection_metric_name = (
+        "holdout_gene_pooled_median"
+        if holdout_n_genes_eval > 0
+        else "pearson_gene_pooled_mean"
+    )
+    best_val_selection_metric = -float("inf")
     best_val_ct_macro = -float("inf")
     best_epoch = None
     best_ckpt_path = None
-    kpi_csv_path = os.path.join(default_results_dir, "main_kpi_summary.csv")
-    epoch_jsonl_path = os.path.join(metrics_dir, "epoch_metrics.jsonl")
-    if initial_epoch == 0:
-        for fp in (kpi_csv_path, epoch_jsonl_path):
-            if os.path.isfile(fp):
-                os.remove(fp)
 
     # Training loop
     for epoch in range(initial_epoch, total_epochs):
@@ -1907,6 +1309,8 @@ def main(config):
                                 if mask_hide_b.any():
                                     expr_b = batch_expr_for_model[b, :n_valid, :]
                                     expr_b[mask_hide_b] = baseline_all[mask_hide_b]
+                        else:
+                            batch_expr_for_model[b, :n_valid, holdout_idx] = 0.0
                         pc_off += n_valid
             else:
                 n_ref_local = expr_ref_batch.shape[0] if expr_ref_batch is not None else 0
@@ -2360,18 +1764,15 @@ def main(config):
                 graph_cross_patch_radius=graph_cross_patch_radius,
                 slide_coord_map_by_slide=slide_coord_map_by_slide,
                 expr_ref_torch_map=expr_ref_torch_val_map,
-                holdout_mask_by_slide=None,
+                holdout_mask_by_slide=holdout_mask_by_slide if holdout_n_genes_eval > 0 else None,
                 gene_names=gene_names,
                 epoch=epoch + 1,
                 per_gene_dir=None,
                 svg_rank_gene_indices_by_slide=val_svg_rank_indices_by_slide,
                 svg_topk=svg_topk,
             )
-            metric_utils.log_gene_pcc_epoch(
-                val_metrics,
-                split_tag="VAL",
-                epoch=epoch + 1,
-                svg_topk=svg_topk,
+            imputer_task.log_holdout_svg_pearson(
+                val_metrics, split_tag="VAL", epoch=epoch + 1
             )
 
         ext_metrics = None
@@ -2393,18 +1794,15 @@ def main(config):
                 graph_cross_patch_radius=graph_cross_patch_radius,
                 slide_coord_map_by_slide=slide_coord_map_by_slide,
                 expr_ref_torch_map=expr_ref_torch_map,
-                holdout_mask_by_slide=None,
+                holdout_mask_by_slide=holdout_mask_by_slide if holdout_n_genes_eval > 0 else None,
                 gene_names=gene_names,
                 epoch=epoch + 1,
                 per_gene_dir=None,
                 svg_rank_gene_indices_by_slide=ext_svg_rank_indices_by_slide,
                 svg_topk=svg_topk,
             )
-            metric_utils.log_gene_pcc_epoch(
-                ext_metrics,
-                split_tag="EXT",
-                epoch=epoch + 1,
-                svg_topk=svg_topk,
+            imputer_task.log_holdout_svg_pearson(
+                ext_metrics, split_tag="EXT", epoch=epoch + 1
             )
         elif external_dataloader is not None:
             logging.info(
@@ -2413,8 +1811,18 @@ def main(config):
                 ext_eval_every_epochs,
             )
 
+        val_selection_metric = (
+            float(val_metrics.get(best_selection_metric_name, 0.0))
+            if isinstance(val_metrics, dict)
+            else 0.0
+        )
         val_gene_pooled_mean = (
             float(val_metrics.get("pearson_gene_pooled_mean", 0.0))
+            if isinstance(val_metrics, dict)
+            else 0.0
+        )
+        val_holdout_pooled_median = (
+            float(val_metrics.get("holdout_gene_pooled_median", 0.0))
             if isinstance(val_metrics, dict)
             else 0.0
         )
@@ -2423,72 +1831,54 @@ def main(config):
             if isinstance(val_metrics, dict)
             else 0.0
         )
-        if isinstance(ext_metrics, dict):
-            ext_gene_pooled_record = float(
-                ext_metrics.get("pearson_gene_pooled_mean", 0.0)
-            )
+
+        primary_improved = val_selection_metric > (best_val_selection_metric + best_metric_eps)
+        primary_tied = abs(val_selection_metric - best_val_selection_metric) <= best_metric_eps
+        if holdout_n_genes_eval > 0:
+            should_update_best = primary_improved
         else:
-            ext_gene_pooled_record = None
-        record = {
-            "epoch": int(epoch + 1),
-            "checkpoint": ckpt_model_path,
-            "train_loss_total": float(loss_epoch),
-            "val_pearson_gene_pooled_mean": val_gene_pooled_mean,
-            "val_ct_accuracy_macro": val_ct_macro,
-            "ext_pearson_gene_pooled_mean": ext_gene_pooled_record,
-            "external_source": external_source_tag,
-            "parity_tolerance_abs": parity_tolerance_abs,
-        }
-        epoch_records.append(record)
-        os.makedirs(metrics_dir, exist_ok=True)
-        with open(epoch_jsonl_path, "a", encoding="utf-8") as f_jsonl:
-            f_jsonl.write(json.dumps(record) + "\n")
-        df_epochs = pd.DataFrame(epoch_records)
-        df_epochs.to_csv(kpi_csv_path, index=False)
-        df_epochs.to_csv(os.path.join(metrics_dir, "epoch_metrics.csv"), index=False)
-
-        if val_metrics is not None:
-            metrics_payload = {
-                "epoch": int(epoch + 1),
-                "checkpoint": ckpt_model_path,
-                "val": val_metrics,
-                "external": ext_metrics if ext_metrics is not None else {},
-            }
-            _write_json(
-                os.path.join(metrics_dir, f"epoch_{epoch + 1:03d}_metrics.json"),
-                metrics_payload,
+            ct_constraint_ok = (
+                best_epoch is None
+                or val_ct_macro >= (best_val_ct_macro - best_metric_eps)
+            )
+            should_update_best = (primary_improved and ct_constraint_ok) or (
+                primary_tied and val_ct_macro > (best_val_ct_macro + best_metric_eps)
             )
 
-        primary_improved = val_gene_pooled_mean > (best_val_gene_pooled + best_metric_eps)
-        primary_tied = abs(val_gene_pooled_mean - best_val_gene_pooled) <= best_metric_eps
-        ct_constraint_ok = (
-            best_epoch is None
-            or val_ct_macro >= (best_val_ct_macro - best_metric_eps)
-        )
-        if (primary_improved and ct_constraint_ok) or (
-            primary_tied and val_ct_macro > (best_val_ct_macro + best_metric_eps)
-        ):
-            best_val_gene_pooled = val_gene_pooled_mean
+        if should_update_best:
+            best_val_selection_metric = val_selection_metric
             best_val_ct_macro = val_ct_macro
             best_epoch = int(epoch + 1)
             best_ckpt_path = ckpt_model_path
-        elif primary_improved and not ct_constraint_ok:
+        elif holdout_n_genes_eval <= 0 and primary_improved and not ct_constraint_ok:
             logging.info(
-                "Best-checkpoint update rejected at epoch %d: pooled_gene_pearson %.6f > %.6f but ct_macro %.6f < %.6f",
+                "Best-checkpoint update rejected at epoch %d: %s %.6f > %.6f but ct_macro %.6f < %.6f",
                 epoch + 1,
-                val_gene_pooled_mean,
-                best_val_gene_pooled,
+                best_selection_metric_name,
+                val_selection_metric,
+                best_val_selection_metric,
                 val_ct_macro,
                 best_val_ct_macro,
             )
 
     # Best-checkpoint summary
     strict_best = {
-        "selection_metric": "pearson_gene_pooled_mean",
-        "selection_constraint": "non_decreasing_ct_accuracy_macro",
+        "task_name": TASK_NAME,
+        "task_description": TASK_DESCRIPTION,
+        "gene_mask_imputer": imputer_cfg_resolved,
+        "selection_metric": best_selection_metric_name,
+        "selection_constraint": (
+            "none" if holdout_n_genes_eval > 0 else "non_decreasing_ct_accuracy_macro"
+        ),
         "best_epoch": int(best_epoch) if best_epoch is not None else None,
-        "best_val_pearson_gene_pooled_mean": (
-            float(best_val_gene_pooled) if np.isfinite(best_val_gene_pooled) else None
+        "best_val_selection_metric": (
+            float(best_val_selection_metric) if np.isfinite(best_val_selection_metric) else None
+        ),
+        "last_val_pearson_gene_pooled_mean": (
+            val_gene_pooled_mean if "val_gene_pooled_mean" in locals() else None
+        ),
+        "last_val_holdout_gene_pooled_median": (
+            val_holdout_pooled_median if "val_holdout_pooled_median" in locals() else None
         ),
         "best_val_ct_accuracy_macro": (
             float(best_val_ct_macro) if np.isfinite(best_val_ct_macro) else None
@@ -2497,8 +1887,8 @@ def main(config):
         "parity_tolerance_abs": parity_tolerance_abs,
         "external_source": external_source_tag,
     }
-    _write_json(os.path.join(metrics_dir, "strict_best.json"), strict_best)
-    _write_json(os.path.join(experiment_path, "strict_best.json"), strict_best)
+    imputer_task.write_json(os.path.join(metrics_dir, "strict_best.json"), strict_best)
+    imputer_task.write_json(os.path.join(experiment_path, "strict_best.json"), strict_best)
     logging.info("Training finished")
 
 

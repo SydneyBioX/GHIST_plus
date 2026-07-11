@@ -352,18 +352,25 @@ def main(config):
         panel_use_morph,
     )
 
+    regions_train = getattr(opts, "regions_train", None)
+    train_regions = regions_train if regions_train is not None else getattr(opts, "regions_val", None)
+    if train_regions is None:
+        raise ValueError(
+            "No regions specified for training (expected regions_train or regions_val in config)."
+        )
+
     # Expression baselines and imputation statistics
-    gene_means = {}
-    for g in gene_names:
-        vals = []
-        for df_expr_tmp in expr_per_source.values():
-            if g in df_expr_tmp.columns:
-                v = df_expr_tmp[g].to_numpy()
-                if v.size > 0:
-                    vals.append(v)
-        gene_means[g] = float(np.mean(np.concatenate(vals))) if vals else 0.0
-    gene_means_series = pd.Series(gene_means)
+    gene_means_series, ct_means_fallback = reference_utils.build_train_region_expression_fallbacks(
+        sources_trainval,
+        train_regions,
+        config.fold_id,
+        gene_names,
+        classes if use_celltype else None,
+        expr_per_source=expr_per_source,
+    )
+    gene_means_series = gene_means_series.reindex(gene_names).fillna(0.0)
     gene_means_vec = gene_means_series.to_numpy()
+    logging.info("Built train-region expression fallback means for %d genes", len(gene_names))
     use_expr_baseline = bool(getattr(opts.training, "use_expr_baseline", False))
     if use_expr_baseline:
         baseline_torch = torch.from_numpy(gene_means_vec.astype(np.float32)).float().to(device)
@@ -374,42 +381,8 @@ def main(config):
     holdout_genes_by_slide = {}
     holdout_mask_by_slide = {}
 
-    ct_means = None
-    ct_means_fallback = None
     ct_series_map = {}
     if use_celltype:
-        n_classes_local = len(classes)
-        ct_sums = np.zeros((n_classes_local, len(gene_names)), dtype=np.float64)
-        ct_counts_arr = np.zeros((n_classes_local, len(gene_names)), dtype=np.int64)
-
-        def _load_ct_series(fp_ct):
-            if fp_ct is None or not os.path.isfile(fp_ct):
-                return None
-            df_ct = pd.read_csv(fp_ct, index_col="c_id")
-            ct_numeric = pd.to_numeric(df_ct["ct"], errors="coerce")
-            is_all_numbers = ct_numeric.notna().all()
-            unassigned_idx = (
-                classes.index("Unassigned")
-                if any(str(c).strip().lower() == "unassigned" for c in classes)
-                else (len(classes) - 1)
-            )
-            if not is_all_numbers:
-                ct_dict = {name: idx for idx, name in enumerate(classes)}
-                mapped = (
-                    df_ct["ct"]
-                    .astype(str)
-                    .str.strip()
-                    .map(ct_dict)
-                    .fillna(unassigned_idx)
-                    .astype(int)
-                )
-                return mapped
-            ct_vals = ct_numeric.astype(int)
-            if ct_vals.min() >= 1 and ct_vals.max() <= len(classes):
-                ct_vals = ct_vals - 1
-            ct_vals = ct_vals.clip(lower=0, upper=len(classes) - 1)
-            return ct_vals
-
         if holdout_n_genes_eval > 0:
             def _svg_scores_for_slide(src, df_expr_local, present_genes):
                 """
@@ -470,7 +443,9 @@ def main(config):
                 present = [g for g in df_expr_tmp.columns.tolist() if g in gene_names]
                 if not present:
                     continue
-                ct_series_tmp = _load_ct_series(getattr(src, "fp_cell_type", None))
+                ct_series_tmp = reference_utils.load_ct_series_for_classes(
+                    getattr(src, "fp_cell_type", None), classes
+                )
                 idx = (
                     df_expr_tmp.index.intersection(ct_series_tmp.index)
                     if ct_series_tmp is not None
@@ -548,53 +523,39 @@ def main(config):
                 )
 
         for src in all_sources:
-            ct_series_tmp = _load_ct_series(getattr(src, "fp_cell_type", None))
+            ct_series_tmp = reference_utils.load_ct_series_for_classes(
+                getattr(src, "fp_cell_type", None), classes
+            )
             if ct_series_tmp is None:
                 continue
             ct_series_map[getattr(src, "fp_expr", "")] = ct_series_tmp
-            if src not in stats_sources:
-                continue
-            df_expr_tmp = expr_per_source[src.fp_expr].reindex(columns=gene_names)
-            idx = df_expr_tmp.index.intersection(ct_series_tmp.index)
-            if idx.empty:
-                continue
-            expr_arr = df_expr_tmp.loc[idx].to_numpy(dtype=np.float64)
-            ct_arr = ct_series_tmp.loc[idx].to_numpy(dtype=np.int64)
-            valid_mask = np.isfinite(expr_arr)
-            for ct_val in np.unique(ct_arr):
-                if ct_val < 0 or ct_val >= n_classes_local:
-                    continue
-                rows = ct_arr == ct_val
-                if not rows.any():
-                    continue
-                expr_rows = expr_arr[rows]
-                valid_rows = valid_mask[rows]
-                ct_sums[ct_val] += np.nansum(np.where(valid_rows, expr_rows, 0.0), axis=0)
-                ct_counts_arr[ct_val] += valid_rows.sum(axis=0)
-
-        with np.errstate(divide="ignore", invalid="ignore"):
-            ct_means = np.divide(ct_sums, ct_counts_arr, where=ct_counts_arr > 0)
-        ct_means_fallback = np.where(
-            ct_counts_arr > 0,
-            ct_means,
-            np.broadcast_to(gene_means_vec, ct_means.shape),
-        )
 
     avgexp_df_by_slide = {}
     if use_avgexp and use_celltype and classes:
-        avgexp_df_by_slide = reference_utils.build_avgexp_df_by_slide(
-            all_sources,
-            stats_sources,
+        avgexp_df_by_slide = reference_utils.build_train_region_avgexp_df_by_slide(
+            sources_trainval,
+            train_regions,
+            config.fold_id,
             gene_names,
             classes,
             float(opts.data.expr_scale),
             holdout_mask_by_slide=holdout_mask_by_slide,
-            expr_per_source=expr_per_source,
             domain_specific=avgexp_domain_specific,
         )
+        missing_trainval_refs = [
+            int(getattr(src, "slide_idx", -1))
+            for src in sources_trainval
+            if int(getattr(src, "slide_idx", -1)) not in avgexp_df_by_slide
+        ]
+        if missing_trainval_refs:
+            raise RuntimeError(
+                "Train-region avgexp refs missing for trainval slide(s): "
+                + ", ".join(map(str, missing_trainval_refs))
+            )
 
         logging.info(
-            "Built %savgexp priors for %d slide(s) (shape %dx%d)",
+            "Built %strain-region avgexp priors for %d trainval slide(s) "
+            "(shape %dx%d)",
             "domain-specific " if avgexp_domain_specific else "global ",
             len(avgexp_df_by_slide),
             len(classes),
@@ -603,7 +564,9 @@ def main(config):
 
     # Imputation cache
     gene_union_hash = hashlib.md5(",".join(gene_names).encode("utf-8")).hexdigest()[:8]
-    impute_dir = os.path.join(cache_root, f"imputed_{gene_union_hash}")
+    impute_dir = os.path.join(
+        cache_root, f"imputed_trainregionfb_f{config.fold_id}_{gene_union_hash}"
+    )
     os.makedirs(impute_dir, exist_ok=True)
     force_reimpute = str(os.environ.get("FORCE_REIMPUTE", "0")).strip().lower() in {
         "1",
@@ -865,62 +828,10 @@ def main(config):
     # Datasets and loaders
     logging.info("Preparing data")
 
-    regions_train = getattr(opts, "regions_train", None)
-    train_regions = regions_train if regions_train is not None else getattr(opts, "regions_val", None)
-    if train_regions is None:
-        raise ValueError("No regions specified for training (expected regions_train or regions_val in config).")
-
     expr_ref_torch_val = expr_ref_torch
     expr_ref_torch_val_map = expr_ref_torch_map
     if use_avgexp and use_celltype and classes:
-        fallback_val_df_by_slide = {}
-        for src in sources_trainval:
-            slide_id = int(getattr(src, "slide_idx", -1))
-            df_ref = avgexp_df_by_slide.get(slide_id)
-            if df_ref is not None:
-                fallback_val_df_by_slide[slide_id] = df_ref
-        avgexp_val_df_by_slide = reference_utils.build_train_region_avgexp_df_by_slide(
-            sources_trainval,
-            train_regions,
-            config.fold_id,
-            gene_names,
-            classes,
-            float(opts.data.expr_scale),
-            fallback_df_by_slide=fallback_val_df_by_slide,
-            holdout_mask_by_slide=holdout_mask_by_slide,
-            domain_specific=avgexp_domain_specific,
-        )
-        if avgexp_val_df_by_slide:
-            ref_stack_val = []
-            ref_counts_val = []
-            expr_ref_torch_val_map = dict(expr_ref_torch_map)
-            for slide_id, df_ref_tmp in avgexp_val_df_by_slide.items():
-                df_aligned = df_ref_tmp.reindex(columns=gene_names)
-                ref_counts_val.append(df_aligned.shape[0])
-                ref_np = df_aligned.to_numpy(dtype=np.float32)
-                expr_ref_torch_val_map[int(slide_id)] = torch.from_numpy(ref_np).float().to(device)
-                ref_stack_val.append(ref_np)
-
-            unique_val_counts = set(ref_counts_val)
-            if len(unique_val_counts) != 1:
-                logging.warning(
-                    "Validation train-region avgexp refs differ in count %s; falling back to standard refs.",
-                    sorted(unique_val_counts),
-                )
-                expr_ref_torch_val = expr_ref_torch
-                expr_ref_torch_val_map = expr_ref_torch_map
-            elif ref_stack_val:
-                expr_ref_torch_val = torch.from_numpy(
-                    np.nanmean(np.stack(ref_stack_val, axis=0), axis=0)
-                ).float().to(device)
-                logging.info(
-                    "Validation avgexp refs use train-region-only statistics for %d train slide(s).",
-                    len(ref_stack_val),
-                )
-        else:
-            logging.warning(
-                "Validation train-region avgexp refs could not be built; using standard refs.",
-            )
+        logging.info("Validation avgexp refs reuse train-region-only training refs.")
 
     immune_sampler_boost = float(getattr(opts.training, "immune_sampler_boost", 1.0))
     if immune_sampler_boost <= 1.0 and use_celltype:
