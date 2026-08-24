@@ -1,0 +1,11 @@
+slide_id,rank,gene,gene_index,selected_for_mask
+4,1,CCDC80,48,True
+4,2,CXCL12,112,True
+4,3,EGR1,138,True
+4,4,GATA3,171,True
+4,5,KRT7,222,True
+4,6,MUC1,264,True
+4,7,SCD,327,True
+4,8,SERPING1,336,True
+4,9,STC2,361,True
+4,10,TPD52,389,True

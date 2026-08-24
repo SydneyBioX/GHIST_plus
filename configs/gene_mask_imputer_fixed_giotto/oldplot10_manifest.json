@@ -1,0 +1,66 @@
+{
+  "source_dir": "per_gene_pearson",
+  "source_epoch": 10,
+  "genes_by_slide": {
+    "0": [
+      "ANKRD30A",
+      "CCND1",
+      "CEACAM6",
+      "EPCAM",
+      "ERBB2",
+      "FASN",
+      "FOXA1",
+      "GATA3",
+      "KRT7",
+      "SCD"
+    ],
+    "1": [
+      "CLIC6",
+      "GATA3",
+      "KRT14",
+      "MUC1",
+      "MYBPC1",
+      "MYH11",
+      "PGR",
+      "SERPINA3",
+      "SFRP1",
+      "TPD52"
+    ],
+    "5": [
+      "CLIC6",
+      "FASN",
+      "GATA3",
+      "KRT14",
+      "LYZ",
+      "MYBPC1",
+      "PGR",
+      "SERPINA3",
+      "SFRP1",
+      "TPD52"
+    ],
+    "2": [
+      "ADH1B",
+      "CCDC80",
+      "CXCL12",
+      "FASN",
+      "FOXA1",
+      "GATA3",
+      "KRT7",
+      "SCD",
+      "TACSTD2",
+      "TPD52"
+    ],
+    "4": [
+      "CCDC80",
+      "CXCL12",
+      "EGR1",
+      "GATA3",
+      "KRT7",
+      "MUC1",
+      "SCD",
+      "SERPING1",
+      "STC2",
+      "TPD52"
+    ]
+  }
+}

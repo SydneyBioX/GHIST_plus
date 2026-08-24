@@ -1,0 +1,11 @@
+slide_id,rank,gene,gene_index,selected_for_mask
+5,1,CLIC6,98,True
+5,2,FASN,154,True
+5,3,GATA3,171,True
+5,4,KRT14,224,True
+5,5,LYZ,246,True
+5,6,MYBPC1,267,True
+5,7,PGR,296,True
+5,8,SERPINA3,334,True
+5,9,SFRP1,337,True
+5,10,TPD52,389,True

@@ -1,0 +1,11 @@
+slide_id,rank,gene,gene_index,selected_for_mask
+2,1,ADH1B,7,True
+2,2,CCDC80,48,True
+2,3,CXCL12,112,True
+2,4,FASN,154,True
+2,5,FOXA1,165,True
+2,6,GATA3,171,True
+2,7,KRT7,222,True
+2,8,SCD,327,True
+2,9,TACSTD2,364,True
+2,10,TPD52,389,True

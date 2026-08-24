@@ -1,0 +1,11 @@
+slide_id,rank,gene,gene_index,selected_for_mask
+0,1,ANKRD30A,19,True
+0,2,CCND1,55,True
+0,3,CEACAM6,86,True
+0,4,EPCAM,144,True
+0,5,ERBB2,147,True
+0,6,FASN,154,True
+0,7,FOXA1,165,True
+0,8,GATA3,171,True
+0,9,KRT7,222,True
+0,10,SCD,327,True

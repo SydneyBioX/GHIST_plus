@@ -1,0 +1,148 @@
+{
+  "comps": {
+    "avgexp": true,
+    "celltype": true,
+    "crossattn": true,
+    "use_neighb": true,
+    "neighb": true
+  },
+  "regions_val": {
+    "divisions": [
+      [
+        0.0,
+        0.2
+      ]
+    ]
+  },
+  "data": {
+    "cell_types": [
+      "B",
+      "Myeloid (excluding macrophage)",
+      "Stromal",
+      "Macrophage",
+      "Malignant",
+      "Epithelial",
+      "Plasma",
+      "T",
+      "Unassigned"
+    ],
+    "min_nuc_area": 10,
+    "expr_scale": 2.0,
+    "foundation_model_input_normalization": "uni2_imagenet",
+    "num_workers": 24,
+    "hsize": 224,
+    "wsize": 224,
+    "overlap": 30,
+    "max_cells_per_patch": 2048,
+    "pin_memory": false
+  },
+  "model": {
+    "foundation_model": {
+      "enabled": true,
+      "pretrained": true,
+      "train_adapter": false
+    },
+    "emb_dim": 1024,
+    "avgexp_temp": 1.0,
+    "avgexp_residual_scale": 1.0,
+    "refiner_query_tokens": 8,
+    "hurdle": {
+      "enabled": true,
+      "sigma_init": 0.5,
+      "sigma_floor": 0.03
+    },
+    "ecrm": {
+      "k_target": 12,
+      "k_min": 6,
+      "k_max": 16,
+      "graph_k": 12,
+      "cross_patch_k": 8,
+      "density_gamma": 0.4,
+      "eta_max": 0.6,
+      "gamma_perp_max": 0.3,
+      "trust_floor": 0.35,
+      "trust_scale": 0.65,
+      "depth": 1,
+      "cross_patch": true,
+      "edge_dropout": 0.0,
+      "message_dropout": 0.0,
+      "residual_gate_init": -1.0,
+      "cross_patch_radius": 512.0,
+      "ct_same_type_only": true,
+      "ct_conf_min": 0.2,
+      "apply_to_embeddings": false,
+      "apply_to_ref_weights": false,
+      "apply_to_expr_residual": true,
+      "use_gt_ct": false,
+      "enabled": true,
+      "ablation_off": false
+    },
+    "vq_patch": {
+      "enabled": true,
+      "n_codes": 64,
+      "beta": 0.25,
+      "use_cosine": true,
+      "inject_cell": false,
+      "loss_w": 0.05
+    },
+    "ct_priors_ecrm_unit_enabled": true
+  },
+  "training": {
+    "batch_size": 64,
+    "total_epochs": 30,
+    "learning_rate": 0.00115,
+    "beta1": 0.9,
+    "beta2": 0.999,
+    "weight_decay": 0.00001,
+    "eps": 1E-8,
+    "stain_aug": true,
+    "uniform_sampler": true,
+    "immune_sampler_boost": 1.0,
+    "panel_completion_loss_weight": 0.0,
+    "panel_hide_frac": 0.0,
+    "panel_use_natural_missing": false,
+    "pearson_loss_weight": 0.0,
+    "expr_var_penalty_weight": 0.0,
+    "use_expr_baseline": false,
+    "holdout_n_genes": 0,
+    "batch_sampler_seed": 20260419,
+    "seed": 20260807
+  },
+  "evaluation": {
+    "parity_tolerance_abs": 0.001,
+    "external_source": "data_sources_train_val"
+  },
+  "save_freqs": {
+    "model_freq": 1
+  },
+  "experiment_dirs": {
+    "load_dir": "results",
+    "metrics_dir": "metrics",
+    "model_dir": "models"
+  },
+  "stain_norm": {
+    "norm_train": false,
+    "norm_val": false,
+    "norm_test": false,
+    "fp_norm_ref": "${GHIST_DATA_ROOT}/data_processing/data_processing_breast2/he_image.tif",
+    "resized_scale": 0.2
+  },
+  "data_sources_train_val": [
+    {
+      "slide_idx": 3,
+      "domain_id": 0,
+      "fp_nuc_seg": "${GHIST_DATA_ROOT}/data_processing/data_processing_breast2/he_image_nuclei_seg.tif",
+      "fp_hist": "${GHIST_DATA_ROOT}/data_processing/data_processing_breast2/he_image.tif",
+      "fp_expr": "${GHIST_DATA_ROOT}/data_processing/data_processing_breast2/cell_gene_matrix_filtered.csv",
+      "fp_cell_type": "${GHIST_DATA_ROOT}/data_processing/data_processing_breast2/cell_type_filtered.csv",
+      "fp_nuc_sizes": "${GHIST_DATA_ROOT}/data_processing/data_processing_breast2/matched_nuclei_filtered.csv",
+      "cell_coords_id_space": "histology",
+      "cell_coords_validate_alignment": true,
+      "cell_coords_alignment_sample_size": 256,
+      "cell_coords_alignment_tolerance_px": 1.0,
+      "cell_coords_alignment_window_radius_px": 64
+    }
+  ],
+  "data_sources_test": [],
+  "run_label": "breast2_ablation9_full"
+}
