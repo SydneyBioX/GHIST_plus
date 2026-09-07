@@ -51,6 +51,15 @@ large downloads. Training can download UNI2-H through the Hugging Face cache.
 These notebooks regenerate figures from the released expression predictions and
 analysis tables. Training and checkpoint reconstruction are not required.
 
+| Notebook | Contents |
+| --- | --- |
+| [Figure2.ipynb](Figure2.ipynb) | Pathway and regional analyses |
+| [Figure3.ipynb](Figure3.ipynb) | Expression prediction benchmarks |
+| [Figure4.ipynb](Figure4.ipynb) | Gene imputation and VQ/composition ablation |
+| [Figure5.ipynb](Figure5.ipynb) | Single-slide and PanCancer comparisons |
+
+Bundled input paths retain their original filenames.
+
 After [Installation](#installation), run the following from the repository
 folder. Replace `/path/to/bundle` with your chosen download folder for the
 [public bundle](https://huggingface.co/datasets/GHISTPlus/GHIST-Plus-bundle)

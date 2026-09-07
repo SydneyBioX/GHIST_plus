@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Golden regression tests for the Figure3.ipynb GT-only SVG selector."""
+"""Golden regression tests for the Figure4.ipynb GT-only SVG selector."""
 
 from __future__ import annotations
 
@@ -72,7 +72,7 @@ def _figure3_golden_fixture():
 def test_exact_figure3_scores_log1p_pipeline_and_reverse_mergesort_ties():
     raw_ground_truth, coordinates = _figure3_golden_fixture()
 
-    # Figure3.ipynb performs this transform in the caller, before the exact
+    # Figure4.ipynb performs this transform in the caller, before the exact
     # float32 Giotto rank-correlation helper.
     expression = np.log1p(raw_ground_truth)
     scores, order = figure3_giotto_scores_and_order(
@@ -247,4 +247,4 @@ if __name__ == "__main__":
     test_exact_figure3_selector_rejects_invalid_gt_or_coordinates()
     test_exact_figure3_selector_does_not_clamp_knn_k()
     test_frozen_val_cohort_uses_emitted_ids_gt_order_and_shared_hash()
-    print("Figure3 SVG selector tests passed")
+    print("Figure4 SVG selector tests passed")

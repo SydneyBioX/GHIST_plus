@@ -1,4 +1,4 @@
-"""Focused tests for the exact Figure3 SVG rank and FULL epoch selector."""
+"""Focused tests for the exact Figure4 SVG rank and FULL epoch selector."""
 
 from __future__ import annotations
 

@@ -463,7 +463,7 @@ def fixed_gt_svg_validation_metrics(
     *,
     svg_topk=(20, 50),
 ):
-    """Compute strict Figure3 Top-K metrics on the frozen VAL cohort."""
+    """Compute strict Figure4 Top-K metrics on the frozen VAL cohort."""
 
     from utils.hurdle_metrics import within_validation_cmd, within_validation_ssim
 
@@ -595,7 +595,7 @@ def fixed_gt_svg_validation_metrics(
             }
 
     output = {
-        "rank_source": "frozen validation GT only; exact Figure3.ipynb Giotto implementation",
+        "rank_source": "frozen validation GT only; exact Figure4.ipynb Giotto implementation",
         "selection_scope": "VAL only; external evaluation is never used",
         "frozen_slide_sha256": {
             str(slide_id): fixed_svg_cohort_by_slide[slide_id]["frozen_sha256"]
@@ -920,7 +920,7 @@ def evaluate_hurdle_validation(
         )
 
     # Evaluation-only diagnostics. These are the current within-validation
-    # cohort, not the immutable cohorts used for any canonical Figure 2 claim.
+    # cohort, not the immutable cohorts used for any canonical Figure 3 claim.
     n_genes = hard_prediction.shape[1]
     ssim_scores_by_slide = []
     ssim_protocol_by_slide = {}

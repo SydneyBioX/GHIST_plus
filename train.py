@@ -171,7 +171,7 @@ def _build_fixed_figure3_svg_cohort(
     *,
     k_neighbors=8,
 ):
-    """Freeze Figure3's GT/coordinate/actual-VAL cohort before epoch one."""
+    """Freeze Figure4's GT/coordinate/actual-VAL cohort before epoch one."""
 
     source_by_slide = {
         int(getattr(source, "slide_idx", -1)): source for source in raw_sources
@@ -214,7 +214,7 @@ def _build_fixed_figure3_svg_cohort(
             )
         if cell_ids.size <= int(k_neighbors):
             raise RuntimeError(
-                f"Validation slide {slide_id} has {cell_ids.size} cells; Figure3 k={int(k_neighbors)} needs more"
+                f"Validation slide {slide_id} has {cell_ids.size} cells; Figure4 k={int(k_neighbors)} needs more"
             )
 
         gt_genes = [gene for gene in raw.columns if gene in model_gene_index]
@@ -295,7 +295,7 @@ def _build_fixed_figure3_svg_cohort(
         }
 
     return cohorts, {
-        "protocol": "Figure3.ipynb exact GT-only Giotto SVG ranking",
+        "protocol": "Figure4.ipynb exact GT-only Giotto SVG ranking",
         "ground_truth_transform": "reject negative/nonfinite raw counts, then numpy.log1p(float64); rank helper casts expression to float32",
         "cohort": "actual deterministic deduplicated VAL IDs in raw-GT row order; raw-GT genes in raw-GT column order",
         "coordinates": "corrected histology map converted from (y,x) to float64 (x,y)",
@@ -1510,7 +1510,7 @@ def main(config, variant=TrainingVariant.BASE):
         )
         _lock_svg_cohort_manifest(fixed_svg_cohort_audit, metrics_dir)
         logging.info(
-            "Frozen Figure3 VAL SVG cohort: sha256=%s slides=%d kNN=%d sample_cap=none",
+            "Frozen Figure4 VAL SVG cohort: sha256=%s slides=%d kNN=%d sample_cap=none",
             fixed_svg_cohort_audit["combined_frozen_sha256"],
             len(fixed_svg_cohort_by_slide),
             svg_knn_k,

@@ -2,7 +2,7 @@
 
 These metrics are deliberately labelled *within-validation, non-canonical*.
 They use the same unique-cell hard prediction matrix as the distribution and
-gene-PCC diagnostics.  They are not the immutable Figure 2 cohorts.
+gene-PCC diagnostics.  They are not the immutable Figure 3 cohorts.
 """
 
 from __future__ import annotations

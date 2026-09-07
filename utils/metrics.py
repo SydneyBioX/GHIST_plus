@@ -74,7 +74,7 @@ def giotto_rank_scores(expr, coords, k=8):
 
 
 def figure3_giotto_scores_and_order(expression, coordinates, k=8):
-    """Exact GT-only Giotto ranker used by ``Figure3.ipynb``.
+    """Exact GT-only Giotto ranker used by ``Figure4.ipynb``.
 
     The implementation intentionally preserves the notebook's float32 ranks,
     cKDTree query, correlation formula, and reverse-mergesort tie order.
@@ -88,17 +88,17 @@ def figure3_giotto_scores_and_order(expression, coordinates, k=8):
     expression = np.asarray(expression, np.float32)
     if expression.ndim != 2 or coordinates.shape != (expression.shape[0], 2):
         raise ValueError(
-            "Figure3 SVG ranking expects expression [cells,genes] "
+            "Figure4 SVG ranking expects expression [cells,genes] "
             "and coordinates [cells,2]"
         )
     if expression.shape[0] <= int(k):
         raise ValueError(
-            f"Figure3 SVG ranking k={int(k)} requires at least {int(k) + 1} cells"
+            f"Figure4 SVG ranking k={int(k)} requires at least {int(k) + 1} cells"
         )
     if not np.isfinite(expression).all() or not np.isfinite(coordinates).all():
-        raise ValueError("Figure3 SVG ranking inputs must be finite")
+        raise ValueError("Figure4 SVG ranking inputs must be finite")
     if np.any(expression < 0):
-        raise ValueError("Figure3 SVG ranking log1p(raw GT) must be non-negative")
+        raise ValueError("Figure4 SVG ranking log1p(raw GT) must be non-negative")
 
     neighbors = cKDTree(coordinates).query(coordinates, k=int(k) + 1)[1][:, 1:]
     scores = np.zeros(expression.shape[1], np.float32)

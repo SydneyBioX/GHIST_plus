@@ -47,7 +47,7 @@ def test_gene_mask_config_is_base_config_plus_one_allowlisted_task_block():
     assert gene_mask == base
     assert set(task) == GENE_MASK_TASK_KEYS
 
-    # Pin the Figure 3 task definition and keep its loss out of shared training
+    # Pin the Figure 4 task definition and keep its loss out of shared training
     # settings.  The common config comparison above guarantees that the stain
     # reference and source panels are also byte-for-byte equivalent as values.
     assert task["enabled"] is True
