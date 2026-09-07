@@ -9,8 +9,7 @@ histology.
 ## Quick Start
 
 - **New users:** start with [tutorial.ipynb](tutorial.ipynb).
-- **Reproduce Figures 2–5:** download the public bundle and set
-  `GHIST_BUNDLE_ROOT`.
+- **Reproduce Figures 2–5:** follow the [figure instructions](#reproduce-figures-25).
 - **Run released-checkpoint inference:** additionally reconstruct the four
   checkpoints once.
 - **Train a model:** install the environment, configure your data, then run
@@ -29,8 +28,9 @@ conda activate model_env
 pip install torch==2.6.0 torchvision==0.21.0 \
   --index-url https://download.pytorch.org/whl/cu124
 pip install numpy pandas scipy scikit-learn matplotlib tqdm natsort h5py
-pip install tifffile imageio opencv-python pillow timm huggingface_hub torchstain
+pip install tifffile imageio opencv-python pillow timm "huggingface_hub>=0.34" torchstain
 pip install git+https://github.com/sebastianffx/stainlib.git
+python -m pip install jupyterlab ipykernel anndata==0.11.4 pyucell==0.5.0 "zarr<3"
 ```
 
 <details>
@@ -45,6 +45,34 @@ Tested package versions include `torch==2.6.0`, `torchvision==0.21.0`,
 
 Installation usually takes 10-30 minutes on a CUDA Linux workstation, excluding
 large downloads. Training can download UNI2-H through the Hugging Face cache.
+
+## Reproduce Figures 2–5
+
+These notebooks regenerate figures from the released expression predictions and
+analysis tables. Training and checkpoint reconstruction are not required.
+
+After [Installation](#installation), run the following from the repository
+folder. Replace `/path/to/bundle` with your chosen download folder for the
+[public bundle](https://huggingface.co/datasets/GHISTPlus/GHIST-Plus-bundle)
+(approximately 38 GB). Skip the download command if you already have the bundle.
+
+```bash
+conda activate model_env
+hf download GHISTPlus/GHIST-Plus-bundle \
+  --repo-type dataset \
+  --local-dir /path/to/bundle
+export GHIST_BUNDLE_ROOT="/path/to/bundle"
+python -m ipykernel install --sys-prefix --name ghist-plus --display-name "GHIST+ (model_env)"
+python -m jupyterlab
+```
+
+Open the desired `Figure2.ipynb`–`Figure5.ipynb`, select **GHIST+ (model_env)**,
+then choose **Restart Kernel and Run All**. Each notebook runs independently.
+Figures appear inside the notebook; save the notebook to keep its outputs.
+
+`GHIST_BUNDLE_ROOT` must point to the folder containing `GHIST_plus/`,
+`evaluation_data/`, `figure_data/`, and `other_models/`. The tutorial uses
+separately prepared training data.
 
 ## Released Data and Checkpoints
 
@@ -63,20 +91,7 @@ The released checkpoints are available in the public
 Each model folder includes its matching config, gene panel, and standardisation
 file. Complete the UNI2-H reconstruction step below before inference.
 
-Download the public
-[GHIST+ bundle](https://huggingface.co/datasets/GHISTPlus/GHIST-Plus-bundle):
-The download is approximately 49 GB (46 GiB).
-
-~~~bash
-huggingface-cli download GHISTPlus/GHIST-Plus-bundle \
-  --repo-type dataset \
-  --local-dir /path/to/bundle
-export GHIST_BUNDLE_ROOT=/path/to/bundle
-~~~
-
-`Figure2.ipynb` through `Figure5.ipynb` read this location through
-`GHIST_BUNDLE_ROOT`. Launch Jupyter from the shell where the variable was
-exported. The tutorial uses separately prepared training data.
+Download the bundle using the [instructions above](#reproduce-figures-25).
 
 The released checkpoints exclude the third-party UNI2-H encoder weights.
 Before using them:
