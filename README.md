@@ -216,14 +216,6 @@ Main outputs:
 - `*_pred_celltype_probs.csv`
 - `*_meta.json`
 
-## Validation
-
-Install `pytest`, then run:
-
-```bash
-python -m pytest -q
-```
-
 ## Repository Layout
 
 - `train.py`: main training entry point.
