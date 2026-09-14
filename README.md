@@ -59,12 +59,12 @@ analysis tables. Training and checkpoint reconstruction are not required.
 
 After [Installation](#installation), run the following from the repository
 folder. Replace `/path/to/bundle` with your chosen download folder for the
-[public bundle](https://huggingface.co/datasets/GHISTPlus/GHIST-Plus-bundle)
+[public bundle](https://huggingface.co/datasets/SydneyBioX/GHIST-Plus-bundle)
 (approximately 38 GB). Skip the download command if you already have the bundle.
 
 ```bash
 conda activate model_env
-hf download GHISTPlus/GHIST-Plus-bundle \
+hf download SydneyBioX/GHIST-Plus-bundle \
   --repo-type dataset \
   --local-dir /path/to/bundle
 export GHIST_BUNDLE_ROOT="/path/to/bundle"
@@ -85,14 +85,14 @@ separately prepared training data.
 ### Pretrained checkpoints
 
 The released checkpoints are available in the public
-[GHIST+ bundle](https://huggingface.co/datasets/GHISTPlus/GHIST-Plus-bundle):
+[GHIST+ bundle](https://huggingface.co/datasets/SydneyBioX/GHIST-Plus-bundle):
 
 | Workflow | Checkpoint |
 | --- | --- |
-| Breast single-slide | [`ghist_plus_breast_single_checkpoint.pth`](https://huggingface.co/datasets/GHISTPlus/GHIST-Plus-bundle/blob/main/GHIST_plus/models/breast_single/ghist_plus_breast_single_checkpoint.pth) |
-| Breast multi-slide | [`ghist_plus_breast_multi_checkpoint.pth`](https://huggingface.co/datasets/GHISTPlus/GHIST-Plus-bundle/blob/main/GHIST_plus/models/breast_multi/ghist_plus_breast_multi_checkpoint.pth) |
-| Gene imputation | [`ghist_plus_gene_imputation_checkpoint.pth`](https://huggingface.co/datasets/GHISTPlus/GHIST-Plus-bundle/blob/main/GHIST_plus/models/imputation/ghist_plus_gene_imputation_checkpoint.pth) |
-| PanCancer | [`ghist_plus_pancancer_checkpoint.pth`](https://huggingface.co/datasets/GHISTPlus/GHIST-Plus-bundle/blob/main/GHIST_plus/models/pancancer/ghist_plus_pancancer_checkpoint.pth) |
+| Breast single-slide | [`ghist_plus_breast_single_checkpoint.pth`](https://huggingface.co/datasets/SydneyBioX/GHIST-Plus-bundle/blob/main/GHIST_plus/models/breast_single/ghist_plus_breast_single_checkpoint.pth) |
+| Breast multi-slide | [`ghist_plus_breast_multi_checkpoint.pth`](https://huggingface.co/datasets/SydneyBioX/GHIST-Plus-bundle/blob/main/GHIST_plus/models/breast_multi/ghist_plus_breast_multi_checkpoint.pth) |
+| Gene imputation | [`ghist_plus_gene_imputation_checkpoint.pth`](https://huggingface.co/datasets/SydneyBioX/GHIST-Plus-bundle/blob/main/GHIST_plus/models/imputation/ghist_plus_gene_imputation_checkpoint.pth) |
+| PanCancer | [`ghist_plus_pancancer_checkpoint.pth`](https://huggingface.co/datasets/SydneyBioX/GHIST-Plus-bundle/blob/main/GHIST_plus/models/pancancer/ghist_plus_pancancer_checkpoint.pth) |
 
 Each model folder includes its matching config, gene panel, and standardisation
 file. Complete the UNI2-H reconstruction step below before inference.
@@ -232,4 +232,4 @@ Main outputs:
 - Keep the config, checkpoint, `genes.txt`, stain standardisation file, and
   matching cache together when moving a trained run.
 - Component-specific third-party terms are provided on the
-  [Hugging Face dataset page](https://huggingface.co/datasets/GHISTPlus/GHIST-Plus-bundle).
+  [Hugging Face dataset page](https://huggingface.co/datasets/SydneyBioX/GHIST-Plus-bundle).
