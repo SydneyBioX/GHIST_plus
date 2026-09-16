@@ -1,0 +1,658 @@
+### Niche detection using BANKSY
+
+```{r}
+### combine all samples
+
+sp_list <- list()
+for (i in 1:length(spe_files)) {
+    sp_list[i] <- readRDS(paste0('/dski/nobackup/beileib/GHIST2/prediction2_spe/', spe_files[i]))
+}
+
+spe_joint <- do.call(cbind, sp_list)
+saveRDS(spe_joint, 'spe_joint.rds')
+
+# Run BANKSY
+
+set.seed(123)
+
+sample_ids <- unique(spe_joint$sample_id)
+spe_bank <- lapply(sample_ids, function(id) {
+  spe_subset <- spe_joint[, spe_joint$sample_id == id]
+  Banksy::computeBanksy(
+    spe_subset,
+    assay_name = "logcounts",
+    k_geom = 18
+  )
+})
+
+spe_joint_bank <- do.call(cbind, spe_bank)
+
+spe_joint_bank <- Banksy::runBanksyPCA(
+  spe_joint_bank,
+  lambda = 0.8,
+  npcs = 30,
+  group = "sample_id"
+)
+
+### 10 clusters
+
+spe_joint_bank <- Banksy::clusterBanksy(
+  spe_joint_bank,
+  lambda = 0.8,
+  npcs = 30,
+  algo = "kmeans",
+  kmeans.centers = 10
+)
+
+clust_col <- grep("^clust_", colnames(colData(spe_joint_bank)), value = TRUE)[1]
+spe_joint$banksy_region <- colData(spe_joint_bank)[, clust_col]
+```
+
+### Generating Figure 5c
+
+```{r}
+celltype_cols <- c(
+  "Epithelial"   = "#D1495B",
+  "Fibroblast"   = "#EDAE49",
+  "Perivascular" = "#A8A44A",
+  "Endothelial"  = "#6A994E",
+  "Macrophage"   = "#72B7A1",
+  "Dendritic"    = "#4C8DB8",
+  "T cell"       = "#5F7FA3",
+  "NK/ILC"       = "#8E6C88",
+  "B cell"       = "#B784A7",
+  "Plasma"       = "#C96D8C"
+)
+
+ggplot(
+  df_prop_niche,
+  aes(
+    x = factor(banksy_region_10),
+    y = prop,
+    fill = cell_type
+  )
+) +
+  geom_col(width = 0.9) +
+  scale_fill_manual(values = celltype_cols) +
+  scale_y_continuous(
+    limits = c(0, 1),
+    expand = c(0, 0),
+    labels = scales::label_percent(accuracy = 1)
+  ) +
+  labs(
+    x = "Niche (BANKSY region)",
+    y = "Cell type proportion",
+    fill = "Cell type"
+  ) +
+  theme_bw() +
+  theme(
+    panel.background = element_blank(),
+    plot.background = element_blank(),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.border = element_rect(
+      colour = "black",
+      fill = NA,
+      linewidth = 0.5
+    ),
+    axis.line = element_blank(),
+    axis.ticks = element_blank(),
+    
+    # Axis labels + tick labels bold
+    axis.title = element_text(face = "bold"),
+    axis.text = element_text(face = "bold"),
+    
+    legend.position = "top"
+  ) +
+  guides(
+    fill = guide_legend(nrow = 2, byrow = TRUE)
+  )
+```
+
+
+### Generating Figure 5d
+
+```{r}
+###############
+## Figure 5d ##
+###############
+
+### test how T cell and macrophage proportion change across age
+df_prop_niche <- metadata %>%
+  group_by(sample_id, age, banksy_region, scClassify) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  group_by(sample_id, banksy_region) %>%
+  mutate(prop = n / sum(n))
+
+df_tcell <- df_prop_niche %>%
+  filter(
+    banksy_region_10 == 3,
+    cell_type == "T cell"
+  ) %>%
+  mutate(niche = "Niche 3")
+
+p_tcell <- ggplot(
+  df_tcell,
+  aes(x = age, y = prop)
+) +
+  geom_point(
+    size = 2.5,
+    alpha = 0.7,
+    colour = "#4C8DB8"
+  ) +
+  geom_smooth(
+    method = "lm",
+    se = TRUE,
+    colour = "#4C8DB8",
+    fill = "#4C8DB8",
+    alpha = 0.20,
+    linewidth = 1
+  ) +
+  annotate(
+    "text",
+    x = Inf,
+    y = Inf,
+    label = "beta = -6.02e-04\np = 0.0042",
+    hjust = 1.1,
+    vjust = 1.3,
+    fontface = "bold",
+    size = 4
+  ) +
+  scale_y_continuous(
+    labels = scales::label_percent(accuracy = 0.1),
+    expand = expansion(mult = c(0.05, 0.12))
+  ) +
+  labs(
+    x = "Age",
+    y = "T cell proportion"
+  ) +
+  facet_wrap(~ niche) +
+  theme_bw() +
+  theme(
+    panel.grid = element_blank(),
+    
+    axis.title = element_text(face = "bold"),
+    axis.text = element_text(face = "bold"),
+    
+    # facet 标题
+    strip.background = element_rect(
+      fill = "white",
+      colour = "black",
+      linewidth = 0.8
+    ),
+    strip.text = element_text(
+      face = "bold",
+      size = 13
+    ),
+    
+    panel.border = element_rect(
+      colour = "black",
+      fill = NA,
+      linewidth = 0.5
+    )
+  )
+
+p_tcell
+
+df_macrophage <- df_prop_niche %>%
+  filter(
+    banksy_region_10 == 4,
+    cell_type == "Macrophage"
+  ) %>%
+  mutate(niche = "Niche 4")
+
+p_macrophage <- ggplot(
+  df_macrophage,
+  aes(x = age, y = prop)
+) +
+  geom_point(
+    size = 2.5,
+    alpha = 0.7,
+    colour = "#6A994E"
+  ) +
+  geom_smooth(
+    method = "lm",
+    se = TRUE,
+    colour = "#6A994E",
+    fill = "#6A994E",
+    alpha = 0.20,
+    linewidth = 1
+  ) +
+  annotate(
+    "text",
+    x = Inf,
+    y = Inf,
+    label = "beta = 1.48e-03\np = 0.0257",
+    hjust = 1.1,
+    vjust = 1.3,
+    fontface = "bold",
+    size = 4
+  ) +
+  scale_y_continuous(
+    labels = scales::label_percent(accuracy = 0.1),
+    expand = expansion(mult = c(0.05, 0.12))
+  ) +
+  labs(
+    x = "Age",
+    y = "Macrophage proportion"
+  ) +
+  facet_wrap(~ niche) +
+  theme_bw() +
+  theme(
+    panel.grid = element_blank(),
+    
+    axis.title = element_text(face = "bold"),
+    axis.text = element_text(face = "bold"),
+    
+    strip.background = element_rect(
+      fill = "white",
+      colour = "black",
+      linewidth = 0.8
+    ),
+    strip.text = element_text(
+      face = "bold",
+      size = 13
+    ),
+    
+    panel.border = element_rect(
+      colour = "black",
+      fill = NA,
+      linewidth = 0.5
+    )
+  )
+
+p_macrophage
+
+library(patchwork)
+
+p_combined <- p_tcell + p_macrophage +
+  plot_layout(ncol = 2)
+
+p_combined
+
+```
+
+
+### Figure 5f: ECM remodelling in microniches which were defined in epithelial compartment
+
+```{r}
+### assign cells to supervised learning compartment (epithelial)
+### nbt features
+ld <- list.dirs('/dski/nobackup/beileib/GHIST2/nbt_features/', full.names = F)
+ld <- ld[-1]
+
+ld1 <- sapply(
+  strsplit(ld, "-"),
+  function(x) paste(x[1:2], collapse = "-")
+)
+
+ld <- ld[match(sampleid, ld1)]
+ld1 <- ld1[match(sampleid, ld1)]
+
+
+spe_joint$x = spe_joint@int_colData@listData[["spatialCoords"]][, 1]
+spe_joint$y = spe_joint@int_colData@listData[["spatialCoords"]][, 2]
+
+cell_df <- data.frame(
+  cell_id = colnames(spe_joint),
+  x = colData(spe_joint)$x,
+  y = colData(spe_joint)$y,
+  sample_id = colData(spe_joint)$sample_id
+)
+
+cell_df$epi_compartment <- FALSE
+
+is_epi_patch <- function(x, y, patch_df, patch_size = 259) {
+
+  any(
+    x >= patch_df$orig_x &
+    x <  patch_df$orig_x + patch_size &
+    y >= patch_df$orig_y &
+    y <  patch_df$orig_y + patch_size
+  )
+}
+
+patch_size <- 259
+
+
+for (i in 1:77) {
+  patch <- read.csv(paste0('/dski/nobackup/beileib/GHIST2/nbt_features/', ld[i], '/', ld[i], '_TC_512_patch_all.csv'))
+  epi_patch <- patch %>% filter(cls == 1)
+  cell_sub <- which(cell_df$sample_id == ld1[i])
+  hit <- mapply(function(cx, cy){
+
+    any(
+      cx >= epi_patch$orig_x &
+      cx <  epi_patch$orig_x + patch_size &
+      cy >= epi_patch$orig_y &
+      cy <  epi_patch$orig_y + patch_size
+    )
+
+  },
+  cell_df$x[cell_sub],
+  cell_df$y[cell_sub]
+  )
+  cell_df$epi_compartment[cell_sub] <- hit
+}
+
+cell_df$epithelial_compartment <- mapply(
+  is_epi_patch,
+  cell_df$x,
+  cell_df$y,
+  MoreArgs = list(
+    patch_df = epi_patch,
+    patch_size = patch_size
+  )
+)
+
+colData(spe_joint)$epi_compartment <- cell_df$epi_compartment
+```
+
+
+```{r}
+### subset to epithelial compartment
+
+spe_epi <- spe_joint[, colData(spe_joint)$epi_compartment]
+
+### do BANKSY again with 6 clusters
+
+set.seed(123)
+
+sample_ids <- unique(spe_epi$sample_id)
+cell_counts <- table(spe_epi$sample_id)
+keep_samples <- names(cell_counts[cell_counts >= 100])
+
+spe_epi_filtered <- spe_epi[, spe_epi$sample_id %in% keep_samples]
+
+spe_bank <- lapply(sample_ids, function(id) {
+  spe_subset <- spe_epi[, spe_epi$sample_id == id]
+  Banksy::computeBanksy(
+    spe_subset,
+    assay_name = "logcounts",
+    k_geom = 10
+  )
+})
+
+spe_joint_bank <- do.call(cbind, spe_bank)
+
+spe_joint_bank <- Banksy::runBanksyPCA(
+    spe_joint_bank,
+    lambda = 0.8,
+    npcs = 30,
+    group = "sample_id"
+  )
+
+spe_joint_bank <- Banksy::clusterBanksy(
+    spe_joint_bank,
+    lambda = 0.8,
+    npcs = 30,
+    algo = "kmeans",
+    kmeans.centers = 6
+  )
+
+saveRDS(spe_joint_bank, 'spe_joint_epicompart.rds')
+```
+
+
+```{r}
+spe_joint_epicompart <- readRDS("/dski/nobackup/beileib/GHIST2/prediction2_spe_immune/spe_joint_epicompart.rds")
+
+df <- data.frame(
+  sample_id = colData(spe_joint_epicompart)$sample_id,
+  age = colData(spe_joint_epicompart)$age,
+  niche = colData(spe_joint_epicompart)$clust_M0_lam0.8_kmeans6,
+  ecm_score = colData(spe_joint_epicompart)$ecm_score
+)
+
+ecm_summary <- df %>%
+  group_by(sample_id, age, niche) %>%
+  summarise(
+    mean_ecm = mean(ecm_score, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+reg_results <- ecm_summary %>%
+  group_by(niche) %>%
+  do({
+    fit <- lm(mean_ecm ~ age, data = .)
+
+    data.frame(
+      beta = coef(fit)["age"],
+      p_value = summary(fit)$coefficients["age", "Pr(>|t|)"]
+    )
+  })
+
+reg_results <- reg_results %>%
+  mutate(
+    label = paste0(
+      "β = ", signif(beta, 2),
+      "\np = ", signif(p_value, 2)
+    )
+  )
+
+library(ggplot2)
+
+# Microniche names epithelial
+niche_labels <- c(
+  "1" = "Microniche1\nAdipose stromal",
+  "2" = "Microniche2\nBasal epithelial",
+  "3" = "Microniche3\nLuminal epithelial",
+  "4" = "Microniche4\nVascular stromal",
+  "5" = "Microniche5\nPerivascular stromal",
+  "6" = "Microniche6\nInflammatory stromal"
+)
+
+# Microniche names stromal
+# niche_labels <- c(
+#   "1" = "Microniche1\nSmooth muscle-like stromal",
+#   "2" = "Microniche2\nEndothelial stromal",
+#   "3" = "Microniche3\nLymphatic endothelial",
+#   "4" = "Microniche4\nFibroblast stromal",
+#   "5" = "Microniche5\nEpithelial niche",
+#   "6" = "Microniche6\nInflammatory niche"
+# )
+
+# Same six colours as before
+niche_cols <- c(
+  "1" = "#D1495B",
+  "2" = "#EDAE49",
+  "3" = "#4C8DB8",
+  "4" = "#72B7A1",
+  "5" = "#8E6C88",
+  "6" = "#6A994E"
+)
+
+ggplot(
+  ecm_summary,
+  aes(
+    x = age,
+    y = mean_ecm,
+    colour = factor(niche),
+    fill = factor(niche)
+  )
+) +
+  geom_point(
+    size = 1.8,
+    alpha = 0.7
+  ) +
+  geom_smooth(
+    method = "lm",
+    se = TRUE,
+    linewidth = 0.9,
+    alpha = 0.18
+  ) +
+  
+  # regression results
+  geom_text(
+    data = reg_results2,
+    aes(
+      x = Inf,
+      y = Inf,
+      label = reg_label
+    ),
+    hjust = 1.08,
+    vjust = 1.15,
+    inherit.aes = FALSE,
+    colour = "black",
+    size = 3.8
+  ) +
+  
+  facet_wrap(
+    ~ niche,
+    nrow = 1,
+    labeller = as_labeller(niche_labels)
+  ) +
+  
+  scale_colour_manual(values = niche_cols) +
+  scale_fill_manual(values = niche_cols) +
+  
+  labs(
+    x = "Age",
+    y = "ECM remodelling score"
+  ) +
+  
+  theme_classic() +
+  theme(
+    # panel border
+    panel.border = element_rect(
+      colour = "black",
+      fill = NA,
+      linewidth = 0.6
+    ),
+    
+    # facet title box
+    strip.background = element_rect(
+      fill = "white",
+      colour = "black",
+      linewidth = 0.6
+    ),
+    
+    strip.text = element_text(
+      face = "bold",
+      size = 11,
+      lineheight = 0.9
+    ),
+    
+    # axes
+    axis.title = element_text(
+      face = "bold",
+      size = 12
+    ),
+    
+    axis.text = element_text(
+      face = "bold",
+      size = 10
+    ),
+    
+    # reduce gaps between panels
+    panel.spacing = unit(0.15, "lines"),
+    
+    # no legend
+    legend.position = "none"
+  )
+
+```
+
+### Find marker genes for each micro-niche using limma - Supplementary Table 2 & 3
+
+```{r}
+
+spe <- readRDS("/dski/nobackup/beileib/GHIST2/prediction2_spe_immune/spe_joint_epicompart.rds")
+
+expr_sparse <- assay(spe, "logcounts")
+cl <- factor(spe$clust_M0_lam0.8_kmeans6)
+
+cluster_levels <- levels(cl)
+
+cluster_stats <- list()
+
+for (k in cluster_levels) {
+  idx <- cl == k
+  out_idx <- !idx
+  cluster_stats[[k]] <- data.frame(
+    gene = rownames(expr_sparse),
+    mean_in = Matrix::rowMeans(expr_sparse[, idx, drop = FALSE]),
+    mean_out = Matrix::rowMeans(expr_sparse[, out_idx, drop = FALSE]),
+    pct_in = Matrix::rowMeans(expr_sparse[, idx, drop = FALSE] > 0),
+    pct_out = Matrix::rowMeans(expr_sparse[, out_idx, drop = FALSE] > 0),
+    stringsAsFactors = FALSE
+  )
+}
+
+expr <- as.matrix(expr_sparse)
+
+### design matrix
+design <- model.matrix(~ 0 + cl)
+colnames(design) <- paste0("niche", cluster_levels)
+
+fit <- lmFit(expr, design)
+
+n <- as.numeric(table(cl))
+names(n) <- paste0("niche", cluster_levels)
+
+contrast_mat <- matrix(
+  0,
+  nrow = length(cluster_levels),
+  ncol = length(cluster_levels),
+  dimnames = list(
+    paste0("niche", cluster_levels),
+    paste0("niche", cluster_levels, "_vs_rest")
+  )
+)
+
+for (k in cluster_levels) {
+  cname <- paste0("niche", k)
+  rest <- setdiff(paste0("niche", cluster_levels), cname)
+  rest_n <- n[rest]
+
+  contrast_mat[cname, paste0(cname, "_vs_rest")] <- 1
+  contrast_mat[rest, paste0(cname, "_vs_rest")] <- -rest_n / sum(rest_n)
+}
+
+fit2 <- contrasts.fit(fit, contrast_mat)
+fit2 <- eBayes(fit2, trend = TRUE, robust = TRUE)
+
+all_top <- list()
+summary_rows <- list()
+
+for (k in cluster_levels) {
+  coef_name <- paste0("niche", k, "_vs_rest")
+
+  tt <- topTable(
+    fit2,
+    coef = coef_name,
+    number = Inf,
+    sort.by = "P"
+  )
+
+  tt$gene <- rownames(tt)
+  tt <- tt[, c("gene", setdiff(colnames(tt), "gene"))]
+
+  st <- cluster_stats[[k]]
+  tt <- merge(tt, st, by = "gene", all.x = TRUE, sort = FALSE)
+
+  tt$delta_mean <- tt$mean_in - tt$mean_out
+  tt$delta_pct <- tt$pct_in - tt$pct_out
+  tt$niche <- k
+
+  tt <- tt[order(tt$adj.P.Val, -tt$logFC), ]
+
+  sig <- tt[tt$adj.P.Val < 0.05 & tt$logFC > 0, , drop = FALSE]
+
+  all_top[[k]] <- head(tt, 100)
+
+  summary_rows[[k]] <- data.frame(
+    niche = k,
+    n_cells = sum(cl == k),
+    n_markers_fdr05_logfc_pos = nrow(sig),
+    top10_genes = paste(head(sig$gene, 10), collapse = ";"),
+    stringsAsFactors = FALSE
+  )
+}
+
+top_combined <- do.call(rbind, all_top)
+summary_df <- do.call(rbind, summary_rows)
+
+```
+
+Please note that the order of micro-niches here is different from the original paper which is because of "set.seed" was different on different machines.
