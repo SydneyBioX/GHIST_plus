@@ -212,6 +212,7 @@ Main outputs:
 
 - `*_pred_expr_scaled.csv`
 - `*_pred_expr_scaled.npz`
+Reconstructed expression is the primary GHIST+ output. Cell-type-head files are auxiliary, and final annotations are obtained from predicted expression using scClassify.
 
 ## Repository Layout
 
