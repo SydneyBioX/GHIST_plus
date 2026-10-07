@@ -212,9 +212,6 @@ Main outputs:
 
 - `*_pred_expr_scaled.csv`
 - `*_pred_expr_scaled.npz`
-- `*_pred_celltype.csv`
-- `*_pred_celltype_probs.csv`
-- `*_meta.json`
 
 ## Repository Layout
 
