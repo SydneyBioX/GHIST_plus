@@ -57,7 +57,11 @@ class DataProcessingUnion(DataProcessing):
         ) = super().__getitem__(idx)
 
         n_cells = int(n_cells_torch.item())
-        mask_pad = torch.zeros_like(expr_torch)
+        # np.zeros is calloc-backed (pages are zeroed lazily by the OS), unlike
+        # torch.zeros_like which memsets the whole padded block.
+        mask_pad = torch.from_numpy(
+            np.zeros(tuple(expr_torch.shape), dtype=np.float32)
+        )
         if n_cells > 0:
             mask_pad[:n_cells, :] = self.gene_mask
 

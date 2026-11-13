@@ -1,0 +1,40 @@
+[project]
+name = "ghist-plus"
+version = "0.0.0"
+description = "GHIST+ training environment"
+requires-python = "==3.10.*"
+dependencies = [
+    "torch==2.6.0",
+    "torchvision==0.21.0",
+    "numpy==1.26.4",
+    "pandas==2.3.2",
+    "scipy==1.15.3",
+    "scikit-learn==1.7.1",
+    "matplotlib==3.8.2",
+    "timm==0.9.12",
+    "huggingface_hub>=0.34",
+    "torchstain==1.4.1",
+    "tqdm",
+    "natsort",
+    "h5py",
+    "tifffile",
+    "imageio",
+    "opencv-python",
+    "pillow",
+    "stainlib",
+]
+
+[tool.uv]
+package = false
+environments = ["sys_platform == 'linux'"]
+
+# CUDA 12.4 wheels, matching the tested torch 2.6.0 + cu124 setup.
+[[tool.uv.index]]
+name = "pytorch-cu124"
+url = "https://download.pytorch.org/whl/cu124"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu124" }
+torchvision = { index = "pytorch-cu124" }
+stainlib = { git = "https://github.com/sebastianffx/stainlib.git" }

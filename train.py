@@ -23,6 +23,7 @@ import natsort
 
 import dataio.dataset_input as dataset_input_base
 import dataio.dataset_input_union as dataset_input
+import dataio.collate as collate_utils
 import dataio.references as reference_utils
 import dataio.samplers as sampler_utils
 import dataio.spatial as spatial_utils
@@ -39,6 +40,7 @@ import utils.checkpoint_selection as checkpoint_selection
 import utils.gene_mask_imputer as imputer_task
 import utils.tma_select as tma_select
 import utils.utils as utils
+from utils.timing import EpochTimer
 
 
 class _ConciseTrainingLogFilter(logging.Filter):
@@ -52,6 +54,7 @@ class _ConciseTrainingLogFilter(logging.Filter):
         "Val cells:",
         "VAL epoch=",
         "VAL HoldoutSVG",
+        "TIMING epoch=",
     )
 
     def filter(self, record):
@@ -1330,6 +1333,16 @@ def main(config, variant=TrainingVariant.BASE):
     if train_loader_kwargs["num_workers"] and train_loader_kwargs["num_workers"] > 0:
         train_loader_kwargs["persistent_workers"] = True
         train_loader_kwargs["prefetch_factor"] = getattr(opts.data, "prefetch_factor", 2)
+    # data.compact_batches: items carry only their real cells and the collate
+    # function pads to the largest cell count in the batch (see dataio/collate.py).
+    batch_collate_fn = (
+        collate_utils.collate_compact_batch
+        if getattr(opts.data, "compact_batches", False)
+        else None
+    )
+    if batch_collate_fn is not None:
+        train_loader_kwargs["collate_fn"] = batch_collate_fn
+        logging.info("Compact batches: padding cells per batch, not per item")
 
     dataloader = DataLoader(
         dataset=train_dataset,
@@ -1473,6 +1486,8 @@ def main(config, variant=TrainingVariant.BASE):
         if opts.data.num_workers and opts.data.num_workers > 0:
             kwargs["persistent_workers"] = True
             kwargs["prefetch_factor"] = getattr(opts.data, "prefetch_factor", 2)
+        if batch_collate_fn is not None:
+            kwargs["collate_fn"] = batch_collate_fn
         return DataLoader(**kwargs)
 
     try:
@@ -1781,6 +1796,7 @@ def main(config, variant=TrainingVariant.BASE):
         )
         loss_total = None
         hurdle_seen_cell_ids = set()
+        epoch_timer = EpochTimer(epoch, device)
 
         for (
             batch_nuclei,
@@ -1792,17 +1808,18 @@ def main(config, variant=TrainingVariant.BASE):
             patch_ids,
             batch_expr_mask,
             batch_slide_id,
-        ) in pbar:
+        ) in epoch_timer.iterate(pbar):
             optimizer.zero_grad()
 
-            batch_nuclei = batch_nuclei.to(device)
-            batch_type_patch = batch_type_patch.to(device)
-            batch_he_img = batch_he_img.to(device)
-            batch_expr = batch_expr.to(device)
-            batch_expr_mask = batch_expr_mask.to(device)
-            batch_n_cells = batch_n_cells.to(device)
-            batch_ct = batch_ct.to(device)
-            patch_ids = patch_ids.to(device)
+            with epoch_timer.h2d():
+                batch_nuclei = batch_nuclei.to(device)
+                batch_type_patch = batch_type_patch.to(device)
+                batch_he_img = batch_he_img.to(device)
+                batch_expr = batch_expr.to(device)
+                batch_expr_mask = batch_expr_mask.to(device)
+                batch_n_cells = batch_n_cells.to(device)
+                batch_ct = batch_ct.to(device)
+                patch_ids = patch_ids.to(device)
             slide_ids_unique = torch.unique(batch_slide_id)
             if slide_ids_unique.numel() != 1:
                 raise RuntimeError("Mixed slides in batch; set batch_size=1 for per-slide avgexp.")
